@@ -6,6 +6,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
+const env = @import("../../../env.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
 const dflash_policy = @import("dflash/policy.zig");
@@ -31,6 +32,17 @@ const sampleRows = @import("../sampling/lazy.zig").sampleRows;
 
 /// Slots one group round carries.
 pub const MAX_SLOTS: usize = dflash_policy.MAX_GROUP_ROWS;
+
+var stage_slots_max: ?usize = null;
+
+/// The most slots a group round still drafts with the stages for (`MLX_SERVE_DSV41_GROUP_DRAFT_MAX`, 4): from 5
+/// requests decoding together the plain batched step gave more tokens a second than any drafting on an M5 Ultra
+/// (8 different requests, greedy: 5 at once 119 against 118, 6: 129 against 123, 8: 135 against 129), every request's
+/// distinct experts filling the step. A copy from the context costs no draft pass and is drafted at any count.
+fn stageSlotsMax() usize {
+    if (stage_slots_max == null) stage_slots_max = if (env.get(.MLX_SERVE_DSV41_GROUP_DRAFT_MAX)) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 4 else 4;
+    return stage_slots_max.?;
+}
 
 /// Whether `xfm` runs DSpark group rounds: a DeepSeek-V4.1 module with its stages that batches its states (resident,
 /// unpaired). Its DSpark slots keep drafting beside company instead of yielding to the plain batch.
@@ -162,7 +174,7 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         const found = idx.matchBest(t1, @intCast(dsv41_mod.maxVerifyDrafts(mdl)));
         const copy = dsparkCopyLen(found, gen.max_tokens -| gen.completion_tokens -| 1, mdl.ds_block);
         // A group with no row to spare verifies no stage draft: it drafts none.
-        const stage = copy == 0 and n < dflash_policy.MAX_GROUP_ROWS and if (gen.dspark_pol) |*pol| pol.drafting.shouldDraft() else true;
+        const stage = copy == 0 and n <= stageSlotsMax() and n < dflash_policy.MAX_GROUP_ROWS and if (gen.dspark_pol) |*pol| pol.drafting.shouldDraft() else true;
         kinds[k] = if (copy > 0) .copy else if (stage) .stage else .plain;
         if (stage) {
             staged[n_stage] = k;
