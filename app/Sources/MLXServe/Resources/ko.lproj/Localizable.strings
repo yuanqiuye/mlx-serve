@@ -780,6 +780,8 @@
 "Edit a file" = "파일 편집";
 "Installing — the app will relaunch." = "설치 중 — 앱이 다시 실행됩니다.";
 "Typical (faster, lossy)" = "일반(더 빠름, 손실 있음)";
+"Typical 0.2 (faster, lossy)" = "일반 0.2(더 빠름, 손실 있음)";
+"Typical 0.4 (milder, lossy)" = "일반 0.4(더 완만함, 손실 있음)";
 "Providers" = "제공자";
 "Model %@" = "모델 %@";
 "brewing" = "아이디어 우려내는 중";

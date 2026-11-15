@@ -40,6 +40,19 @@ final class ModelSettingsFileTests: XCTestCase {
         XCTAssertEqual(ModelOverride(json: ["mtp_acceptance": "fast"]).mtpAcceptance, nil)
     }
 
+    func testMildTypicalAcceptanceIsWrittenWithItsThreshold() throws {
+        let path = tempPath()
+        var file = ModelSettingsFile()
+        file.set(ModelOverride(json: ["lm_head_mxfp8": true, "mtp_acceptance": "typical:0.4"]), for: "/m/a")
+        try file.save(path: path)
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"mtp_acceptance\" : \"typical:0.4\""), text)
+        let back = ModelSettingsFile.load(path: path).override(for: "/m/a")
+        XCTAssertEqual(back?.mtpAcceptance, .typicalMild)
+        XCTAssertEqual(back?.extra["lm_head_mxfp8"] as? Bool, true)
+        XCTAssertEqual(MtpAcceptanceChoice.allCases.filter(\.isLossy), [.typicalMild, .typical, .tokenv3])
+    }
+
     func testMtpGreedyTailRoundTripsAsABoolean() throws {
         let path = tempPath()
         var file = ModelSettingsFile()

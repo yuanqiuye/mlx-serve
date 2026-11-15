@@ -159,7 +159,7 @@ extension DrafterGems {
         let drafter = drafterDir.flatMap(config).flatMap(stone(drafterConfig:))
         if let drafter, drafter != .ruby { return SocketBadge(stone: drafter, skull: false) }
         guard hasMtpHead, o.mtp ?? options.enableMTP else { return SocketBadge(stone: drafter, skull: false) }
-        return SocketBadge(stone: .emerald, skull: o.mtpAcceptance == .typical || o.mtpAcceptance == .tokenv3)
+        return SocketBadge(stone: .emerald, skull: o.mtpAcceptance?.isLossy == true)
     }
 
     /// The pack's own drafter folder, found as the server finds it (`dflash.resolveInDirDrafter`):

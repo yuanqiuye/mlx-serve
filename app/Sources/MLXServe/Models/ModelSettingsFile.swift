@@ -19,16 +19,22 @@ enum KvQuantChoice: String, CaseIterable {
 /// Typical and TokenV3 accept more drafts but change the output distribution.
 enum MtpAcceptanceChoice: String, CaseIterable {
     case exact
+    /// Local build: typical acceptance at delta 0.4, the server's `typical:<delta>` spelling. `typical` alone is 0.2.
+    case typicalMild = "typical:0.4"
     case typical
     case tokenv3
 
     var label: String {
         switch self {
         case .exact: "Exact (Default)"
-        case .typical: "Typical (faster, lossy)"
+        case .typicalMild: "Typical 0.4 (milder, lossy)"
+        case .typical: "Typical 0.2 (faster, lossy)"
         case .tokenv3: "TokenV3 (fastest, very lossy)"
         }
     }
+
+    /// Anything but exact keeps drafts the trunk would not have sampled itself.
+    var isLossy: Bool { self != .exact }
 }
 
 /// One model's entry in `~/.mlx-serve/model-settings.json` — the file the

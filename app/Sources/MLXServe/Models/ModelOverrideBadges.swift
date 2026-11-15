@@ -36,7 +36,7 @@ enum ModelOverrideBadges {
             out.append(OverrideBadge(kind: .engine, text: "Int8", help: "Engine: lossy int8 prefill", lossy: true))
         }
 
-        let lossyAcceptance = o.mtpAcceptance == .typical || o.mtpAcceptance == .tokenv3
+        let lossyAcceptance = o.mtpAcceptance?.isLossy == true
         var spec: [String] = []
         if let stone = socket.stone { spec.append(stone.label + (socket.skull ? ", lossy acceptance" : "")) }
         if let d = o.drafter { spec.append("drafter " + (d == "off" || d == "auto" ? d : "custom")) }

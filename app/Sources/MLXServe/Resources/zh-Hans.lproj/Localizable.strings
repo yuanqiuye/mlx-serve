@@ -1769,6 +1769,8 @@
 "Turn Tools On & Send" = "开启工具并发送";
 "Turn Tools on first?" = "先开启工具？";
 "Typical (faster, lossy)" = "典型（更快，有损）";
+"Typical 0.2 (faster, lossy)" = "典型 0.2（更快，有损）";
+"Typical 0.4 (milder, lossy)" = "典型 0.4（较保守，有损）";
 "URL" = "网址";
 "URL must start with http:// or https://" = "URL 必须以 http:// 或 https:// 开头";
 "Unknown" = "未知";
