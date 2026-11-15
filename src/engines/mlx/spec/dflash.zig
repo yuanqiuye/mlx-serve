@@ -62,6 +62,10 @@ pub const DflashPol = struct {
     plain: dflash_policy.PlainCost = .{},
     /// How copied continuations have fared.
     copy: dflash_policy.CopyStats = .{},
+    /// What this model's verifies and drafts cost by rows (DSpark: the model's own `dspark_ladder`, carried on).
+    ladder: dflash_policy.VerifyCost = .{},
+    /// The tokens per ms this request is running at, what a verify row's ms is priced against.
+    rate: dflash_policy.Rate = .{},
     /// Since the last pipelined plain tick ended; null once any other kind of round has run.
     plain_watch: ?io_util.Stopwatch = null,
 };

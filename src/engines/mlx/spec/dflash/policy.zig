@@ -56,7 +56,15 @@ const ROW_TIE: f32 = 0.02;
 /// The row count with the best expected tokens per ms. `p[k]` is the probability that draft k is
 /// accepted given drafts 0..k-1 were; `costs` are the verify ms by rows.
 pub fn chooseRows(p: []const f32, costs: *const Costs) Choice {
+    return chooseRowsAt(p, costs, 0);
+}
+
+/// `chooseRows` for a round that costs `fixed_ms` whatever it verifies (the draft's forward): the row count with the
+/// best expected tokens per ms of the whole round. A round's rate is its tokens over its draft and its verify, so a
+/// row that adds less than the verify's own rate can still raise the round's.
+pub fn chooseRowsAt(p: []const f32, costs: *const Costs, fixed_ms: f32) Choice {
     const n: usize = @min(p.len, MAX_DRAFTS); // typed: a bare @min narrows to u4 and n + 2 overflows at 15
+    const fixed: f32 = if (std.math.isFinite(fixed_ms) and fixed_ms > 0) fixed_ms else 0;
     var tokens: [MAX_ROWS + 1]f32 = undefined;
     tokens[1] = 1;
     var alive: f32 = 1;
@@ -65,12 +73,146 @@ pub fn chooseRows(p: []const f32, costs: *const Costs) Choice {
         tokens[k + 2] = tokens[k + 1] + alive;
     }
     var best: f32 = 0;
-    for (1..n + 2) |r| best = @max(best, tokens[r] / costs[r]);
+    for (1..n + 2) |r| best = @max(best, tokens[r] / (fixed + costs[r]));
     for (1..n + 2) |r| {
-        if (tokens[r] / costs[r] >= best * (1 - ROW_TIE)) return .{ .rows = @intCast(r), .tokens = tokens[r], .ms = costs[r] };
+        if (tokens[r] / (fixed + costs[r]) >= best * (1 - ROW_TIE)) return .{ .rows = @intCast(r), .tokens = tokens[r], .ms = costs[r] };
     }
     return .{ .rows = 1, .tokens = 1, .ms = costs[1] };
 }
+
+/// The row count worth the most at `rate` tokens per ms: the expected tokens a verify of r rows emits less what its ms
+/// would have bought at the rate the request is running at. Unlike the best ratio of one round, it prices a row by
+/// what the round's time is worth across rounds: a sure round takes every row, a doubtful one stops where a row's
+/// share of a token falls under `rate` times its ms. The fewer rows on a tie.
+pub fn chooseRowsValue(p: []const f32, costs: *const Costs, rate: f32) Choice {
+    const n: usize = @min(p.len, MAX_DRAFTS);
+    const per_ms: f32 = if (std.math.isFinite(rate) and rate > 0) rate else 0;
+    var best: Choice = .{ .rows = 1, .tokens = 1, .ms = costs[1] };
+    var best_value: f32 = 1 - per_ms * costs[1];
+    var tokens: f32 = 1;
+    var alive: f32 = 1;
+    for (p[0..n], 0..) |pk, k| {
+        alive *= if (pk >= 0) @min(pk, 1) else 0; // a NaN is no acceptance
+        tokens += alive;
+        const value = tokens - per_ms * costs[k + 2];
+        if (value > best_value) {
+            best_value = value;
+            best = .{ .rows = @intCast(k + 2), .tokens = tokens, .ms = costs[k + 2] };
+        }
+    }
+    return best;
+}
+
+/// The rate a request is running at: tokens per ms over its recent rounds and plain ticks, the plain step's until
+/// a round has run.
+pub const Rate = struct {
+    const ALPHA: f32 = 0.05;
+
+    tokens: f32 = 0,
+    ms: f32 = 0,
+
+    pub fn perMs(self: *const Rate, plain_ms: f32) f32 {
+        return if (self.ms > 0) self.tokens / self.ms else 1 / plain_ms;
+    }
+
+    /// A round or tick emitted `tokens` tokens in `ms`.
+    pub fn record(self: *Rate, tokens: f32, ms: f32, plain_ms: f32) void {
+        if (!std.math.isFinite(ms) or ms <= 0 or !(tokens >= 0)) return;
+        if (self.ms <= 0) {
+            self.tokens = 1;
+            self.ms = plain_ms;
+        }
+        // A stall (a kernel's first compile, a foreign GPU job) is not the request's rate.
+        const took = @min(ms, 4 * self.ms);
+        self.tokens += ALPHA * (tokens - self.tokens);
+        self.ms += ALPHA * (took - self.ms);
+    }
+};
+
+/// What a verify of r rows costs on this model and this machine, and what a draft costs, learned from the rounds
+/// themselves the way `PlainCost` learns the plain step. The prior ladder is another model's on another build: its
+/// second row costs 7.8 ms where DeepSeek-V4.1's fused mxfp4 kernels take about 3.5, so a round priced off it leaves
+/// drafts unverified that would have paid for their row.
+pub const VerifyCost = struct {
+    /// A row count's first samples keep the fastest: a stall (a kernel's first compile) only reads slower.
+    const SEED: u32 = 3;
+    /// Samples before a row count's own time prices it.
+    const TRUST: u32 = 2;
+
+    /// Verify ms by rows (index = rows, 0 unused), each over `seen` samples.
+    ms: [MAX_ROWS + 1]f32 = @splat(0),
+    seen: [MAX_ROWS + 1]u32 = @splat(0),
+    /// A draft's forward, the cost a drafted round pays whatever it verifies.
+    draft_ms: f32 = 0,
+    draft_seen: u32 = 0,
+
+    fn learn(cur: *f32, seen: *u32, took: f32) void {
+        if (!std.math.isFinite(took) or took <= 0) return;
+        if (seen.* < SEED) {
+            cur.* = if (seen.* == 0) took else @min(cur.*, took);
+        } else cur.* += 0.1 * (std.math.clamp(took, cur.* * 0.8, cur.* * 1.25) - cur.*);
+        seen.* +|= 1;
+    }
+
+    /// A verify of `rows` rows (t1 included) took `took` ms.
+    pub fn sample(self: *VerifyCost, rows: usize, took: f32) void {
+        if (rows == 0 or rows > MAX_ROWS) return;
+        learn(&self.ms[rows], &self.seen[rows], took);
+    }
+
+    /// A draft's forward took `took` ms.
+    pub fn sampleDraft(self: *VerifyCost, took: f32) void {
+        learn(&self.draft_ms, &self.draft_seen, took);
+    }
+
+    /// What a round's draft costs: 0 until one is measured.
+    pub fn draftMs(self: *const VerifyCost) f32 {
+        return if (self.draft_seen >= TRUST) self.draft_ms else 0;
+    }
+
+    fn known(self: *const VerifyCost, r: usize) bool {
+        return self.seen[r] >= TRUST;
+    }
+
+    /// The verify's ms by rows: a measured row count its own time; one between two measured ones on their line; one
+    /// past the last measured one that row's time plus the prior ladder's steps (scaled to `plain_ms`); never cheaper
+    /// for more rows. With nothing measured this is `priorCosts(plain_ms)`.
+    pub fn costs(self: *const VerifyCost, plain_ms: f32) Costs {
+        const prior = priorCosts(plain_ms);
+        var out = prior;
+        var last: usize = 0; // the last measured row count at or below r
+        for (1..MAX_ROWS + 1) |r| {
+            if (self.known(r)) {
+                out[r] = self.ms[r];
+                last = r;
+                continue;
+            }
+            if (last == 0) continue; // below the first measured row: the prior
+            const next: usize = for (r + 1..MAX_ROWS + 1) |q| {
+                if (self.known(q)) break q;
+            } else 0;
+            if (next != 0) {
+                const t = @as(f32, @floatFromInt(r - last)) / @as(f32, @floatFromInt(next - last));
+                out[r] = self.ms[last] + (self.ms[next] - self.ms[last]) * t;
+            } else out[r] = out[r - 1] + (prior[r] - prior[r - 1]);
+        }
+        for (2..MAX_ROWS + 1) |r| out[r] = @max(out[r], out[r - 1]);
+        return out;
+    }
+
+    /// `1:17.6,2:21.4,...`: the measured row counts, for `[spec-stats]`.
+    pub fn format(self: *const VerifyCost, buf: []u8) []const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        var first = true;
+        for (1..MAX_ROWS + 1) |r| {
+            if (!self.known(r)) continue;
+            if (!first) w.writeAll(",") catch break;
+            first = false;
+            w.print("{d}:{d:.1}", .{ r, self.ms[r] }) catch break;
+        }
+        return w.buffered();
+    }
+};
 
 /// Probability that a draft is accepted given its predecessors were, by the drafter's confidence in
 /// it: online bins over `-log10(1 - conf)` (the selector's shares crowd 0.9..1, where a linear axis has one
@@ -89,6 +231,13 @@ pub const Calibration = struct {
     /// The drafter's confidence is its own acceptance estimate (DSpark's confidence head), the prior the bins start
     /// from; else the logistic fit.
     head: bool = false,
+    /// Pseudo-observations the prior is worth here. A trained confidence head (`HEAD_WEIGHT`) is worth more than
+    /// the fitted curve: over 2,993 DeepSeek-V4.1 rounds its bins sat within a few points of the acceptance they
+    /// named, and bins pulled by three pseudo-counts chased each stretch's noise (a replay: 78.6 tok/s against 79.0
+    /// at twelve, 77.9 against 75.6 for the head alone when the head read 1.5x too sure).
+    prior_weight: f32 = PRIOR_WEIGHT,
+
+    pub const HEAD_WEIGHT: f32 = 12;
 
     /// 0 at a coin flip's confidence, 1 at 0.9, 2 at 0.99, capped at 3.
     fn axis(conf: f32) f32 {
@@ -106,7 +255,7 @@ pub const Calibration = struct {
 
     pub fn probability(self: *const Calibration, conf: f32) f32 {
         const b = bin(conf);
-        return (self.hit[b] + PRIOR_WEIGHT * self.prior(conf)) / (self.seen[b] + PRIOR_WEIGHT);
+        return (self.hit[b] + self.prior_weight * self.prior(conf)) / (self.seen[b] + self.prior_weight);
     }
 
     pub fn observe(self: *Calibration, conf: f32, accepted: bool) void {
@@ -171,11 +320,16 @@ pub const CopyStats = struct {
     /// Verify rows (t1 included) for a copy of up to `avail` drafts: each priced at this match's survival
     /// against the verify ladder scaled to `plain_ms`.
     pub fn rowsFor(self: *const CopyStats, suffix: u32, avail: usize, plain_ms: f32) u32 {
+        const costs = priorCosts(plain_ms);
+        return self.rowsAt(suffix, avail, &costs);
+    }
+
+    /// `rowsFor` against a verify ladder of the caller's (a model's own, `VerifyCost.costs`).
+    pub fn rowsAt(self: *const CopyStats, suffix: u32, avail: usize, costs: *const Costs) u32 {
         var p: [MAX_DRAFTS]f32 = undefined;
         const n = @min(avail, p.len);
         @memset(p[0..n], self.probability(suffix));
-        const costs = priorCosts(plain_ms);
-        return chooseRows(p[0..n], &costs).rows;
+        return chooseRows(p[0..n], costs).rows;
     }
 };
 
@@ -383,6 +537,124 @@ test "priorCosts: scaled to the measured plain step, never cheaper for more rows
     // A faster machine's plain step moves the whole ladder with it.
     const half = priorCosts(8.85);
     try testing.expectApproxEqAbs(c[8] / 2, half[8], 1e-3);
+}
+
+test "chooseRowsAt: a draft already paid for buys rows the verify's own rate would not" {
+    // One draft at 40%: the prior ladder's second row (+7.8 ms on 17.7) does not pay by the verify's rate alone...
+    const costs = priorCosts(17.7);
+    try testing.expectEqual(@as(u32, 1), chooseRows(&[_]f32{0.40}, &costs).rows);
+    try testing.expectEqual(@as(u32, 1), chooseRowsAt(&[_]f32{0.40}, &costs, 0).rows);
+    // ...and does once the round's 6 ms draft is in its cost: 1.4 tokens in 31.5 ms beat 1 in 23.7.
+    try testing.expectEqual(@as(u32, 2), chooseRowsAt(&[_]f32{0.40}, &costs, 6).rows);
+    // A draft that almost never lands is still left alone, and a poisoned fixed cost counts as none.
+    try testing.expectEqual(@as(u32, 1), chooseRowsAt(&[_]f32{0.05}, &costs, 6).rows);
+    try testing.expectEqual(chooseRows(&[_]f32{ 0.9, 0.9 }, &costs).rows, chooseRowsAt(&[_]f32{ 0.9, 0.9 }, &costs, std.math.nan(f32)).rows);
+}
+
+test "chooseRowsValue: rows while a draft's share of a token beats the rate times its ms" {
+    var v: VerifyCost = .{};
+    for (1..7) |r| for (0..3) |_| v.sample(r, 17.5 + 3.5 * @as(f32, @floatFromInt(r - 1)));
+    const costs = v.costs(17.5);
+    // At 0.07 tokens a ms a 3.5 ms row must carry a quarter of a token.
+    try testing.expectEqual(@as(u32, 6), chooseRowsValue(&[_]f32{ 0.95, 0.95, 0.95, 0.95, 0.95 }, &costs, 0.07).rows);
+    try testing.expectEqual(@as(u32, 1), chooseRowsValue(&[_]f32{ 0.2, 0.9, 0.9, 0.9, 0.9 }, &costs, 0.07).rows);
+    try testing.expectEqual(@as(u32, 2), chooseRowsValue(&[_]f32{ 0.3, 0.5, 0.9, 0.9, 0.9 }, &costs, 0.07).rows);
+    // 0.6 then 0.5: the third row carries 0.30 of a token, the fourth 0.15.
+    const c = chooseRowsValue(&[_]f32{ 0.6, 0.5, 0.5, 0.5, 0.5 }, &costs, 0.07);
+    try testing.expectEqual(@as(u32, 3), c.rows);
+    try approx(c.tokens, 1.9);
+    try approx(c.ms, 24.5);
+    // A slower request buys more rows with the same drafts, a faster one fewer.
+    try testing.expect(chooseRowsValue(&[_]f32{ 0.6, 0.5, 0.5, 0.5, 0.5 }, &costs, 0.03).rows > 3);
+    try testing.expect(chooseRowsValue(&[_]f32{ 0.6, 0.5, 0.5, 0.5, 0.5 }, &costs, 0.12).rows < 3);
+    // A dip in the ladder is taken through: rows 5 and 6 together pay where row 5 alone does not.
+    var dip = costs;
+    dip[5] = dip[4] + 8;
+    dip[6] = dip[5] + 0.5;
+    try testing.expectEqual(@as(u32, 6), chooseRowsValue(&[_]f32{ 1, 1, 1, 0.4, 1 }, &dip, 0.07).rows);
+    // No drafts, a poisoned rate or probability: still an answer.
+    try testing.expectEqual(@as(u32, 1), chooseRowsValue(&.{}, &costs, 0.07).rows);
+    try testing.expectEqual(@as(u32, 6), chooseRowsValue(&[_]f32{ 1, 1, 1, 1, 1 }, &costs, std.math.nan(f32)).rows);
+    try testing.expectEqual(@as(u32, 2), chooseRowsValue(&[_]f32{ 1, std.math.nan(f32), 1 }, &costs, 0.01).rows);
+}
+
+test "Rate: the plain step's until a round runs, then the recent rounds', a stall bounded" {
+    var r: Rate = .{};
+    try approx(r.perMs(17.5) * 17.5, 1);
+    for (0..200) |_| r.record(3, 30, 17.5);
+    try approx(r.perMs(17.5) * 10, 1);
+    const before = r.perMs(17.5);
+    r.record(1, 5000, 17.5);
+    try testing.expect(r.perMs(17.5) > before * 0.8);
+    r.record(1, std.math.nan(f32), 17.5);
+    r.record(1, 0, 17.5);
+    try testing.expect(r.perMs(17.5) > before * 0.8);
+}
+
+test "Calibration: a head's weight holds its bins nearer the head than the fitted curve's three counts" {
+    var light = Calibration{ .head = true };
+    var heavy = Calibration{ .head = true, .prior_weight = Calibration.HEAD_WEIGHT };
+    try approx(light.probability(0.7), 0.7);
+    try approx(heavy.probability(0.7), 0.7);
+    for (0..3) |_| {
+        light.observe(0.7, false);
+        heavy.observe(0.7, false);
+    }
+    try testing.expect(heavy.probability(0.7) > light.probability(0.7));
+    try testing.expect(heavy.probability(0.7) < 0.7);
+}
+
+test "VerifyCost: the prior until rows are measured, then each row count's own time" {
+    var v: VerifyCost = .{};
+    const prior = priorCosts(17.5);
+    for (v.costs(17.5), prior) |got, want| try approx(got, want);
+    try testing.expectEqual(@as(f32, 0), v.draftMs());
+    // One sample is not trusted (a first run compiles its kernel); the fastest of the first samples is.
+    v.sample(2, 90);
+    try approx(v.costs(17.5)[2], prior[2]);
+    v.sample(2, 21);
+    v.sample(2, 22);
+    try approx(v.costs(17.5)[2], 21);
+    // Rows 1 and 4 measured: 3 sits on the line from 2 to 4, 5 and 6 step from 4 by the prior's steps.
+    for (0..3) |_| v.sample(1, 17.5);
+    for (0..3) |_| v.sample(4, 28);
+    const c = v.costs(17.5);
+    try approx(c[1], 17.5);
+    try approx(c[3], 24.5);
+    try approx(c[4], 28);
+    try approx(c[5], 28 + (prior[5] - prior[4]));
+    try approx(c[6], c[5] + (prior[6] - prior[5]));
+    for (2..MAX_ROWS + 1) |r| try testing.expect(c[r] >= c[r - 1]);
+    // Later samples move a row by a tenth of a bounded step: a stall cannot pose as the cost.
+    v.sample(2, 500);
+    try approx(v.costs(17.5)[2], 21 + 0.1 * (21 * 1.25 - 21));
+    // A slower measured row never prices a wider verify below a narrower one.
+    for (0..3) |_| v.sample(3, 40);
+    const d = v.costs(17.5);
+    try testing.expect(d[4] >= d[3]);
+    // The draft: trusted from its second sample; bad samples and row counts are ignored.
+    v.sampleDraft(5);
+    v.sampleDraft(4);
+    try approx(v.draftMs(), 4);
+    v.sampleDraft(-1);
+    v.sample(0, 3);
+    v.sample(MAX_ROWS + 1, 3);
+    v.sample(2, std.math.nan(f32));
+    try approx(v.draftMs(), 4);
+    var buf: [128]u8 = undefined;
+    try testing.expect(std.mem.startsWith(u8, v.format(&buf), "1:17.5,2:"));
+}
+
+test "VerifyCost: this model's ladder verifies a draft the prior ladder leaves" {
+    // DeepSeek-V4.1 on the fused mxfp4 kernels: 17.5 ms plain, about 3.5 ms a further row, a 6 ms draft.
+    var v: VerifyCost = .{};
+    for (1..7) |r| for (0..3) |_| v.sample(r, 17.5 + 3.5 * @as(f32, @floatFromInt(r - 1)));
+    for (0..3) |_| v.sampleDraft(6);
+    const own = v.costs(17.5);
+    const prior = priorCosts(17.5);
+    const p = [_]f32{ 0.35, 0.6, 0.6, 0.6, 0.6 };
+    try testing.expectEqual(@as(u32, 1), chooseRows(&p, &prior).rows);
+    try testing.expect(chooseRowsAt(&p, &own, v.draftMs()).rows >= 3);
 }
 
 test "chooseRows: a plain round when nothing pays, the whole chain when everything does" {

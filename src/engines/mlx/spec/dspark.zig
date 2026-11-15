@@ -10,6 +10,7 @@ const model_mod = @import("../../../sdk/config/model.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const dflash_policy = @import("dflash/policy.zig");
 const DflashPol = @import("dflash.zig").DflashPol;
+const log = @import("../../../sdk/util/log.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const testing = std.testing;
@@ -171,10 +172,16 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     defer copy.deinit(allocator);
     const st = &mdl.dec_state.?;
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+    const verify_watch = io_util.Stopwatch.init(self.timer.io);
     const round = if (self.dspark_stochastic)
         try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &copy)
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &copy, cap);
+    if (self.dspark_pol) |*pol| {
+        const copy_ms = msSince(&verify_watch);
+        sampleVerifyMs(self, n + 1, copy_ms);
+        pol.rate.record(@floatFromInt(round.tokens.len), copy_ms, pol.plain.ms);
+    }
     self.dspark_copies += 1;
     self.dspark_copy_drafted += n;
     self.dspark_copy_accepted += round.accepted;
@@ -187,7 +194,9 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
 fn sizedCopyLen(self: *Generator, longest: usize, suffix: u32) usize {
     const pol = if (self.dspark_pol) |*p| p else return longest;
     if (!copySizing()) return longest;
-    return pol.copy.rowsFor(suffix, longest, pol.plain.ms) - 1;
+    if (!learnedLadder()) return pol.copy.rowsFor(suffix, longest, pol.plain.ms) - 1;
+    const own_costs = pol.ladder.costs(pol.plain.ms);
+    return pol.copy.rowsAt(suffix, longest, &own_costs) - 1;
 }
 
 var copy_sizing: ?bool = null;
@@ -219,13 +228,42 @@ pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?Dr
     const pol = &self.dspark_pol.?;
     if (pol.plain_watch) |*w| samplePlainMs(self, msSince(w));
     pol.plain_watch = io_util.Stopwatch.init(self.timer.io);
+    pol.rate.record(1, pol.plain.ms, pol.plain.ms);
     return try mtpSerialOneToken(allocator, tok);
 }
 
 /// A DSpark request's round policy: `plain` is the model's own `dspark_plain`, seeded from this machine's first
 /// steps (`PlainCost.seeded`).
-pub fn dsparkPolicy(plain: dflash_policy.PlainCost, pin_rows: u32) DflashPol {
-    return .{ .calib = .{ .head = true }, .plain = plain, .pin_rows = pin_rows };
+pub fn dsparkPolicy(plain: dflash_policy.PlainCost, ladder: dflash_policy.VerifyCost, pin_rows: u32) DflashPol {
+    const weight: f32 = if (learnedLadder()) dflash_policy.Calibration.HEAD_WEIGHT else (dflash_policy.Calibration{}).prior_weight;
+    return .{ .calib = .{ .head = true, .prior_weight = weight }, .plain = plain, .ladder = ladder, .pin_rows = if (pin_rows != 0) pin_rows else pinRowsDiag() };
+}
+
+var pin_rows_diag: ?u32 = null;
+/// The diag `dsv41-pin-rows=N`: every round verifies N rows where its draft has them (0: the policy chooses).
+fn pinRowsDiag() u32 {
+    if (pin_rows_diag == null) pin_rows_diag = if (env.get(.DSV41_PIN_ROWS)) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0 else 0;
+    return pin_rows_diag.?;
+}
+
+var round_trace: ?bool = null;
+fn roundTrace() bool {
+    if (round_trace == null) round_trace = env.get(.DSV41_ROUND_TRACE) != null;
+    return round_trace.?;
+}
+
+/// A verify of `rows` rows took `ms`: the model's own ladder learns it and carries it to the next request.
+fn sampleVerifyMs(self: *Generator, rows: usize, ms: f32) void {
+    const pol = &self.dspark_pol.?;
+    pol.ladder.sample(rows, ms);
+    self.xfm.dspark_ladder = pol.ladder;
+}
+
+var learned_ladder: ?bool = null;
+/// `DSV41_LEARNED_LADDER=0` prices every round off the prior ladder, the draft's forward left out.
+fn learnedLadder() bool {
+    if (learned_ladder == null) learned_ladder = if (env.get(.DSV41_LEARNED_LADDER)) |v| v[0] != '0' else true;
+    return learned_ladder.?;
 }
 
 /// A plain step's cost, learned per model: the next request starts from it instead of the prior.
@@ -248,7 +286,18 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     const t1 = self.next_token_id;
     var d = try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
     defer d.deinit(allocator);
-    d.len = if (pol.pin_rows > 0) @min(d.len, pol.pin_rows - 1) else dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+    pol.ladder.sampleDraft(@as(f32, @floatFromInt(mdl.ds_draft_ns)) / @as(f32, std.time.ns_per_ms));
+    // The model's own ladder and the rate the request runs at price the rows; what the choice expects, not what one
+    // round happened to keep, tells the drafting backoff whether drafts pay (a round's kept tokens swing between 1
+    // and 6: on prose the backoff skipped a fifth of the ticks of drafts that paid on average).
+    const own_costs = pol.ladder.costs(pol.plain.ms);
+    var expected: ?dflash_policy.Choice = null;
+    if (pol.pin_rows > 0) {
+        d.len = @min(d.len, pol.pin_rows - 1);
+    } else if (learnedLadder()) {
+        expected = dsparkChooseRows(d.confidence[0..d.len], &pol.calib, &own_costs, pol.rate.perMs(pol.plain.ms));
+        d.len = expected.?.rows - 1;
+    } else d.len = dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     const verify_watch = io_util.Stopwatch.init(self.timer.io);
     const round = if (self.dspark_stochastic)
@@ -257,12 +306,21 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
     const verify_ms = msSince(&verify_watch);
     if (d.len == 0) samplePlainMs(self, verify_ms);
+    sampleVerifyMs(self, d.len + 1, verify_ms);
+    if (roundTrace()) {
+        var buf: [160]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        for (d.confidence) |c| w.print(" {d:.4}", .{sigmoid(c)}) catch break;
+        log.info("[dspark-round] rows={d} accepted={d} tokens={d} draft_ms={d:.2} verify_ms={d:.2} conf={s}\n", .{ d.len + 1, round.accepted, round.tokens.len, pol.ladder.draft_ms, verify_ms, w.buffered() });
+    }
     for (d.confidence[0..d.len], 0..) |c, k| {
         if (k > round.accepted) break;
         pol.calib.observe(sigmoid(c), k < round.accepted);
     }
     self.dspark_stats.record(@intCast(d.len), round.accepted);
-    pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, msSince(&watch));
+    const round_ms = msSince(&watch);
+    if (expected) |e| pol.drafting.record(e.tokens * pol.plain.ms, pol.ladder.draftMs() + e.ms) else pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, round_ms);
+    pol.rate.record(@floatFromInt(round.tokens.len), round_ms, pol.plain.ms);
     return self.commitDsparkRound(allocator, round, st.n);
 }
 
@@ -273,11 +331,26 @@ pub fn sigmoid(x: f32) f32 {
 /// Drafts a DSpark round verifies: the prefix whose calibrated acceptance (the confidence head's logits through
 /// `calib`) buys the most tokens per ms of verify, on the verify ladder scaled to this request's plain step.
 pub fn dsparkVerifyDrafts(conf_logits: []const f32, calib: *const dflash_policy.Calibration, plain_ms: f32) usize {
+    const costs = dflash_policy.priorCosts(plain_ms);
+    return dsparkVerifyDraftsAt(conf_logits, calib, &costs, 0);
+}
+
+/// `dsparkVerifyDrafts` on a verify ladder of the caller's (the model's own, `VerifyCost.costs`) for a round whose
+/// draft cost `draft_ms`: the prefix that buys the most tokens per ms of the round, its draft included.
+pub fn dsparkVerifyDraftsAt(conf_logits: []const f32, calib: *const dflash_policy.Calibration, costs: *const dflash_policy.Costs, draft_ms: f32) usize {
     var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
     const n = @min(conf_logits.len, p.len);
     for (conf_logits[0..n], p[0..n]) |c, *o| o.* = calib.probability(sigmoid(c));
-    const costs = dflash_policy.priorCosts(plain_ms);
-    return dflash_policy.chooseRows(p[0..n], &costs).rows - 1;
+    return dflash_policy.chooseRowsAt(p[0..n], costs, draft_ms).rows - 1;
+}
+
+/// The rows a DSpark round verifies (t1 included) on the model's own verify ladder at the rate the request runs at
+/// (`chooseRowsValue`), with the tokens the choice expects and its verify's ms.
+pub fn dsparkChooseRows(conf_logits: []const f32, calib: *const dflash_policy.Calibration, costs: *const dflash_policy.Costs, rate: f32) dflash_policy.Choice {
+    var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+    const n = @min(conf_logits.len, p.len);
+    for (conf_logits[0..n], p[0..n]) |c, *o| o.* = calib.probability(sigmoid(c));
+    return dflash_policy.chooseRowsValue(p[0..n], costs, rate);
 }
 
 /// A draft round's bookkeeping; the module stands at `position`.
@@ -913,7 +986,7 @@ test "Transformer.dspark_plain starts seeded, so every DSpark request measures t
 }
 
 test "dsparkPolicy: DSpark measures the plain step, a DFlash policy keeps the prior" {
-    var dspark = dsparkPolicy(dflash_policy.PlainCost.seeded, 0);
+    var dspark = dsparkPolicy(dflash_policy.PlainCost.seeded, .{}, 0);
     var dflash = DflashPol{};
     dspark.plain.sample(40);
     dflash.plain.sample(40);

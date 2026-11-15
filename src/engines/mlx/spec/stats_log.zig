@@ -65,6 +65,8 @@ pub fn logSpecStats(self: *const Generator) void {
             "  [spec-stats] dspark policy: plain_ticks={d} skipped={d} probes={d} plain_ms={d:.2} acc_pos={s} rows_hist={s}\n",
             .{ self.dspark_plain, pol.drafting.skipped, pol.drafting.probes, pol.plain.ms, self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
         );
+        var ladder_buf: [192]u8 = undefined;
+        if (self.dspark_pol) |pol| log.info("  [spec-stats] dspark costs: draft_ms={d:.2} verify_ms={s} rate={d:.1} tok/s\n", .{ pol.ladder.draft_ms, pol.ladder.format(&ladder_buf), 1000 * pol.rate.perMs(pol.plain.ms) });
         return;
     }
     if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) {

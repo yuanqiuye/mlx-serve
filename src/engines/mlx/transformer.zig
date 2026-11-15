@@ -416,6 +416,9 @@ pub const Transformer = struct {
     dspark_group_cost: @import("spec/dflash/policy.zig").GroupCost = .{},
     /// What a plain DSpark step costs on this model, carried from request to request. Inference thread only.
     dspark_plain: @import("spec/dflash/policy.zig").PlainCost = @import("spec/dflash/policy.zig").PlainCost.seeded,
+    /// What a DSpark verify costs by rows and a draft costs on this model, carried from request to request
+    /// (`spec/dspark.zig`). Inference thread only.
+    dspark_ladder: @import("spec/dflash/policy.zig").VerifyCost = .{},
     /// Drafted DSpark rounds run since the load, up to the warm-up count. Inference thread only.
     cost_trace_active: bool = false,
     cost_attention: u8 = 0,
