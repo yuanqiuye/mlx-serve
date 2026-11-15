@@ -45,6 +45,8 @@ const wearly = @import("prompt/wide_early.zig");
 /// A wide layer's attention projections' large outputs kept past its teardown, for the next wide layer's to take their
 /// buffers back from MLX's cache.
 const tkeep = @import("prompt/transient_keep.zig");
+/// a wide linear's dequantized weight kept across a prompt's chunks (dense_keep.zig).
+const dkeep = @import("prompt/dense_keep.zig");
 /// A wide layer's heads left unroped, their roped last channels apart, read together by the gather's scores
 /// .
 const qtail = @import("prompt/q_tail.zig");
@@ -318,7 +320,7 @@ pub const Lin = struct {
         if (self.s.ctx == null) return sc.matmul(x, try sc.t2(self.w));
         // Not f32: MLX runs f32 GEMMs on the matrix units as TF32.
         if (mlx.mlx_array_dtype(x) != .float32 and mlx.mlx_array_size(x) / @as(usize, @intCast(dim(x, -1))) >= DENSE_ROWS)
-            return sc.matmul(x, try sc.t2(try self.dense(sc, mlx.mlx_array_dtype(x))));
+            return sc.matmul(x, try sc.t2(try self.denseKept(sc, mlx.mlx_array_dtype(x))));
         var o = mlx.mlx_array_new();
         return sc.res(mlx.mlx_quantized_matmul(&o, x, self.w, self.s, self.b, true, mlx.mlx_optional_int.some(@intCast(self.qp.group_size)), mlx.mlx_optional_int.some(@intCast(self.qp.bits)), self.qp.mode.cstr(), sc.s), &o);
     }
@@ -328,6 +330,15 @@ pub const Lin = struct {
         if (self.ext != null) return error.Dsv41OutsideDense;
         var d = mlx.mlx_array_new();
         return sc.res(mlx.mlx_dequantize(&d, self.w, self.s, self.b, mlx.mlx_optional_int.some(@intCast(self.qp.group_size)), mlx.mlx_optional_int.some(@intCast(self.qp.bits)), self.qp.mode.cstr(), .{ .ctx = null }, .{ .value = dt, .has_value = true }, sc.s), &d);
+    }
+
+    /// `dense` for a prompt chunk's wide call: the weight the prompt's earlier chunk dequantized (dense_keep.zig), else
+    /// dequantized now and kept for the chunks after it. The same op over the same codes: the same bits.
+    pub fn denseKept(self: *const Lin, sc: *Scope, dt: mlx.mlx_dtype) !A {
+        if (dkeep.get(self.w, dt)) |kept| return kept;
+        const fresh = try self.dense(sc, dt);
+        dkeep.put(self.w, dt, fresh);
+        return fresh;
     }
 
     /// Rows `ids` of the table, dequantized to `dt`.
@@ -538,6 +549,8 @@ pub const Dsv41Model = struct {
     pub fn deinit(self: *Dsv41Model) void {
         // scratch_x1.zig: the prompt's regions let go with the model.
         sx1.releaseAll();
+        // dense_keep.zig: so are the prompt's dequantized weights (their keys are this model's handles).
+        dkeep.releaseAll();
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
         self.gpa.free(self.prompt);
@@ -3481,7 +3494,7 @@ pub fn attnOutA(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a:
     const L = dim(ob, 1);
     // An outside plugin's groups: its grouped linear reads `[L, og, in]`.
     if (ly.wo_a.ext) |*e| return sc.astype(try sc.reshape(try sc.keep(try e.matmul(try sc.transpose(ob, &.{ 1, 0, 2 }), sc.s)), &.{ ci(L), -1 }), m.act);
-    const wd = dense_wo_a orelse if (ly.wo_a.s.ctx == null) ly.wo_a.w else if (L >= DENSE_ROWS) try ly.wo_a.dense(sc, mlx.mlx_array_dtype(ob)) else none;
+    const wd = dense_wo_a orelse if (ly.wo_a.s.ctx == null) ly.wo_a.w else if (L >= DENSE_ROWS) try ly.wo_a.denseKept(sc, mlx.mlx_array_dtype(ob)) else none;
     const oa = if (wd.ctx != null)
         try sc.matmul(ob, try sc.transpose(wd, &.{ 0, 2, 1 }))
     else blk: {
@@ -4908,6 +4921,8 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     }
     // scratch_x1.zig: the prompt's regions let go before a decode forward.
     if (L <= region_rows) sx1.releaseAll();
+    // dense_keep.zig: and the prompt's dequantized weights.
+    if (L <= region_rows) dkeep.releaseAll();
     // the ring's regions let go before the phase change too, so its synchronize and clearCache take them
     // (not decode's capped cache).
     if (L <= region_rows) sat.releaseAll();
@@ -5542,7 +5557,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
                 run_scope = null;
             }
         } else {
-            if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and sp.L >= DENSE_ROWS) woa_dense = try ly.wo_a.dense(&sc, m.act);
+            if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and sp.L >= DENSE_ROWS) woa_dense = try ly.wo_a.denseKept(&sc, m.act);
             const oa = try attnOutA(&ssc, m, ly, o_k, if (woa_dense.ctx != null) woa_dense else null);
             // A tensor split sums each span's wo_b on the CPU stream while the GPU runs the next span's attention.
             heads[n_heads] = try sc.keep(ssc.out(if (m.tp != null) try tpSum(&ssc, m, try ly.wo_b.apply(&ssc, oa)) else oa));
