@@ -1881,6 +1881,12 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         m.n_mtp = n_stages;
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
         m.ds_block = cfg.dsv4_dspark_block_size;
+        // `MLX_SERVE_DSV41_DSPARK_BLOCK`: a longer (or shorter) block than the checkpoint's; a verify block of it stays
+        // on the fused decode kernels up to `dkern.max_rows` rows.
+        if (env.get(.MLX_SERVE_DSV41_DSPARK_BLOCK)) |v| if (std.fmt.parseInt(usize, std.mem.span(v), 10) catch null) |b| if (b >= 1 and b < dkern.max_rows) {
+            m.ds_block = b;
+            log.info("deepseek_v41: DSpark block {d} (the checkpoint's is {d})\n", .{ b, cfg.dsv4_dspark_block_size });
+        };
         if (!worker and !tp_worker and opts.tp == null and m.head.ext == null and m.head.w.ctx != null and m.head.s.ctx == null and draftHead8Wanted()) {
             m.draft_head = try quantizedCopy(m, m.head, 8, 64);
             log.info("deepseek_v41: DSpark drafts through an 8-bit copy of the lm head (MLX_SERVE_DSV41_DRAFT_HEAD8=1; unset: the dense head)\n", .{});
