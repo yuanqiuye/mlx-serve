@@ -6719,6 +6719,7 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
     defer gpa.free(parts);
     for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
     if (m.tp != null and try batchedFused(&sc, m, states, sp, li, parts)) return;
+    if (m.tp == null and try batchedSolo(&sc, m, states, sp, li, parts)) return;
     if (li >= m.regions.len or !compiledAt(m, sp.L)) {
         // No compiled stretch at this width: each state's block alone.
         for (parts, states, 0..) |x, st, k| {
@@ -6763,6 +6764,124 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
         hold(&sp.xs[k], try sc.slice(o[0], 0, lo, hi));
         hold(&sp.pres[k], try sc.slice(o[1], 0, lo, hi));
     }
+}
+
+var batch_fused_on: ?bool = null;
+
+/// `MLX_SERVE_DSV41_BATCH_FUSED=0` keeps `batchedLayer`'s compiled stretches.
+fn batchFusedOn() bool {
+    if (batch_fused_on == null) batch_fused_on = if (env.get(.MLX_SERVE_DSV41_BATCH_FUSED)) |v| v[0] != '0' else true;
+    return batch_fused_on.?;
+}
+
+/// One Mac's `batchedLayer` on the fused decode kernels (what a single request's `blockFused` runs), false (before any
+/// state moves) where they decline: the projections, wo_a and the FFN read their weights once for every state's rows,
+/// up to `dkern.max_rows` of them, each roped at its own state's position; each state's window, compressor, indexer
+/// and attention partials are its own. The compiled stretches read wo_a, wo_b and the experts through MLX's ops, at
+/// about 6-8 ms a further request where a verify block's further row costs 3.9 ms.
+fn batchedSolo(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const Spans, li: usize, parts: []const A) !bool {
+    if (!batchFusedOn()) return false;
+    const kp = &(m.dec.in_proj orelse return false);
+    const kq = m.dec.wq_b orelse return false;
+    const ka = m.dec.attn orelse return false;
+    const kw = m.dec.wo_a orelse return false;
+    const N = states.len;
+    if (N > dkern.max_rows or sp.L > dkern.max_rows or li >= m.regions.len or m.streamed != null) return false;
+    const ly = &m.layers[li];
+    const x = try sc.concat(parts, 0);
+    const a = try dkern.in_proj.run(sc, kp, m, ly, x, try sc.concat(sp.pres, 0)) orelse return false;
+    var pos: [dkern.max_rows]i32 = undefined;
+    for (states, 0..) |st, k| {
+        const lo, const hi = sp.bounds(k);
+        for (pos[lo..hi], 0..) |*o, r| o.* = @intCast(st.n + r);
+    }
+    const pos_a = try sc.ints(pos[0..sp.L], &.{ci(sp.L)});
+    const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, pos_a) orelse return false;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.cfg.head_dim)));
+    const inv = ropeFor(m, li).inv;
+    // Each state's rows into its own window, compressor and indexer, then its attention's split partials.
+    var qs: [dkern.max_rows]A = undefined;
+    var comps: [dkern.max_rows]A = undefined;
+    var picks: [dkern.max_rows]A = undefined;
+    var accs: [dkern.max_rows]A = undefined;
+    var maxes: [dkern.max_rows]A = undefined;
+    var sums: [dkern.max_rows]A = undefined;
+    var splits: c_int = 0;
+    var have = true; // every state's partials
+    var same = true; // … at one split count: one wo_a launch takes them all
+    for (states, 0..) |st, k| {
+        const lo, const hi = sp.bounds(k);
+        const p0 = st.n;
+        const ls = &st.layers[li];
+        try ls.win.write(try sc.slice(w.kv_row, 0, lo, hi), p0, sc.s);
+        var comp_rows = none;
+        var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k] };
+        if (ly.ratio > 0) {
+            const clen = (p0 + hi - lo) / ly.ratio;
+            if (ly.comp) |*cw| {
+                const rows = try sc.slice(a.comp.?, 0, lo, hi);
+                if (!try compressFused(sc, m, st, li, rows, p0)) try compressFrom(sc, m, st, li, cw, rows, p0);
+            }
+            if (ly.idx) |_| sh.topk = if (clen == 0) none else try indexerQ(sc, m, st, li, try sc.slice(a.iw.?, 0, lo, hi), try sc.slice(w.q_idx.?, 0, lo, hi), p0, &sh);
+            if (clen > 0 and sh.topk.ctx != null) comp_rows = try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s));
+        }
+        qs[k] = try sc.slice(w.q, 0, lo, hi);
+        comps[k] = comp_rows;
+        picks[k] = sh.topk;
+        if (have) {
+            if (try dkern.attn.partials(sc, ka, m, qs[k], ls.win, comp_rows, sh.topk, p0, scale)) |p| {
+                accs[k] = p.acc;
+                maxes[k] = p.m;
+                sums[k] = p.l;
+                if (k == 0) splits = p.splits else if (p.splits != splits) {
+                    same = false;
+                }
+            } else have = false;
+        }
+        hold(&sp.topks[k], sh.topk);
+        hold(&sp.cands[k], sh.cand);
+    }
+    // wo_a: one launch over every state's rows where their partials share a split count, else a launch a state.
+    var oa: ?A = null;
+    if (have and same) {
+        oa = try dkern.wo_a.applyRows(sc, m, ly, kw, m.dec.wo_a_counter, inv, pos_a, try sc.concat(accs[0..N], 0), try sc.concat(maxes[0..N], 0), try sc.concat(sums[0..N], 0));
+    } else if (have) {
+        var each: [dkern.max_rows]A = undefined;
+        var all = true;
+        for (states, 0..) |st, k| {
+            const meta = try attnMeta(sc, m, qs[k], st.layers[li].win, comps[k], picks[k], st.n);
+            each[k] = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, meta, accs[k], maxes[k], sums[k]) orelse {
+                all = false;
+                break;
+            };
+        }
+        if (all) oa = try sc.concat(each[0..N], 0);
+    }
+    var y = none;
+    var pre = none;
+    done: {
+        if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &w.sa)) |f| {
+            pre = f.sf.pre;
+            y = try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
+            break :done;
+        };
+        var ao: [1]A = undefined;
+        if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else {
+            var heads: [dkern.max_rows]A = undefined;
+            for (states, 0..) |st, k| heads[k] = try attnDecode(sc, m, ly, qs[k], st.layers[li].win, comps[k], picks[k], st.n, scale, inv);
+            try runRegion(sc, m, li, .attn_out, &.{try sc.concat(heads[0..N], 0)}, &ao);
+        }
+        var out: [2]A = undefined;
+        try runRegion(sc, m, li, .ffn, &.{ x, ao[0], w.sa.pre, w.sa.post, w.sa.comb }, &out);
+        y = out[0];
+        pre = out[1];
+    }
+    for (0..N) |k| {
+        const lo, const hi = sp.bounds(k);
+        hold(&sp.xs[k], try sc.slice(y, 0, lo, hi));
+        hold(&sp.pres[k], try sc.slice(pre, 0, lo, hi));
+    }
+    return true;
 }
 
 /// A tensor split's `batchedLayer` on the fused decode kernels, false (before any state moves) where they decline: the

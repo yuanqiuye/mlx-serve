@@ -736,9 +736,9 @@ fn integerLin(sc: *dsv41.Scope, rng: std.Random, n: usize) !dsv41.Lin {
 
 /// Threadgroup counts the tests launch: the machine's (0), and few enough that each walks many units (7 is the least
 /// that holds 6 window rows and the split).
-const test_groups = [_]usize{ 0, 7, 19 };
+const test_groups = [_]usize{ 0, decode.max_rows + 1, 19 }; // a launch needs a threadgroup more than its rows
 
-test "dsv41 dec wq_b: bit-equal to the chain where every sum is exact (small integers), 1..6 rows, with and without the indexer" {
+test "dsv41 dec wq_b: bit-equal to the chain where every sum is exact (small integers), every row count, with and without the indexer" {
     if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const fx = try fixture.Fixture.init(testing.allocator, .{ .lo = 20, .hi = 21, .experts = 2, .ctx = 0 });
     defer fx.deinit();

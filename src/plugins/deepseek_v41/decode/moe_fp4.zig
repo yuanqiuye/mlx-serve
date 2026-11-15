@@ -822,11 +822,11 @@ test "dsv41 dec moe_fp4: formats and shapes it does not serve are declined" {
     var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
     const k = m.cfg.hidden_size;
-    var ids: [42]u32 = undefined;
+    var ids: [(decode.max_rows + 1) * 6]u32 = undefined;
     for (&ids, 0..) |*e, i| e.* = @intCast(i % 6);
-    const ws: [42]f32 = @splat(0.1);
+    const ws: [(decode.max_rows + 1) * 6]f32 = @splat(0.1);
     var served: ?A = null;
-    for ([_]usize{ 2, 7 }) |rows| {
+    for ([_]usize{ 2, decode.max_rows + 1 }) |rows| {
         const h2 = try sc.keep(try fx.normal(&.{ ci(rows), ci(k) }, .bfloat16, 0, 1));
         const idx = try sc.keep(mlx.mlx_array_new_data(&ids, &[_]c_int{ ci(rows), 6 }, 2, .uint32));
         const wts = try sc.keep(mlx.mlx_array_new_data(&ws, &[_]c_int{ ci(rows), 6 }, 2, .float32));

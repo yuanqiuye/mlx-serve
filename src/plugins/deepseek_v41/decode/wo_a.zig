@@ -66,7 +66,7 @@ pub const Plan = struct {
     tg: [3]c_int,
     out: [2]c_int,
     parts: [3]c_int,
-    ints: [11]Int,
+    ints: [12]Int,
 
     pub const Int = struct { name: [*:0]const u8, v: c_int };
 };
@@ -90,6 +90,8 @@ pub fn plan(rows: c_int, heads: c_int, splits: c_int, dim: c_int, groups: c_int,
             .{ .name = "OL", .v = out_rank }, .{ .name = "OW", .v = groups * out_rank },
             .{ .name = "NSG", .v = nsg },     .{ .name = "NR", .v = nr },
             .{ .name = "NAX", .v = @intFromBool(nax) },
+            // `launchRows` sets it: `meta` is then every row's own position.
+            .{ .name = "PR", .v = 0 },
         },
     };
 }
@@ -99,6 +101,16 @@ pub fn plan(rows: c_int, heads: c_int, splits: c_int, dim: c_int, groups: c_int,
 /// `w` [groups, o_lora, K / 4] and scales [groups, o_lora, K / 32]; `extra` is an input the kernel never reads (a
 /// chain's dependency). Null where the shapes or formats are not the kernel's.
 pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.mlx_dtype, ins: [8]A, counter: A, extra: ?A) !?A {
+    return launchWith(sc, kern, rd, odt, ins, counter, extra, false);
+}
+
+/// `launch` for rows of different requests: `ins[4]` (`meta`) is every row's own position, `[R]` int32.
+pub fn launchRows(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.mlx_dtype, ins: [8]A, counter: A) !?A {
+    if (mlx.mlx_array_size(ins[4]) != mlx.getShape(ins[0])[0]) return null;
+    return launchWith(sc, kern, rd, odt, ins, counter, null, true);
+}
+
+fn launchWith(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.mlx_dtype, ins: [8]A, counter: A, extra: ?A, per_row: bool) !?A {
     const ps = mlx.getShape(ins[0]);
     const ws = mlx.getShape(ins[6]);
     if (ps.len != 4 or ws.len != 3) return null;
@@ -112,7 +124,7 @@ pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.m
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &p.parts, 3, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, p.grid[0], p.grid[1], p.grid[2]));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, p.tg[0], p.tg[1], p.tg[2]));
-    for (p.ints) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t.name, t.v));
+    for (p.ints) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t.name, if (per_row and std.mem.orderZ(u8, t.name, "PR") == .eq) 1 else t.v));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OT", odt));
     var all: [10]A = undefined;
     @memcpy(all[0..8], &ins);
@@ -134,6 +146,14 @@ pub fn apply(sc: *Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, ker
     const wo = &ly.wo_a;
     if (!mlx.streamIsGpu(sc.s) or wo.s.ctx == null or wo.qp.mode != .mxfp8 or wo.qp.bits != 8 or wo.qp.group_size != 32) return null;
     return launch(sc, kern, m.cfg.dsv4_rope_head_dim, m.act, .{ pacc, pm, pl, ly.sink, meta, inv, wo.w, wo.s }, counter, null);
+}
+
+/// `apply` over rows of different requests, their partials joined along the rows: `pos` `[R]` int32 is each row's
+/// position. One read of wo_a for every request's rows.
+pub fn applyRows(sc: *Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, kern: mlx.mlx_fast_metal_kernel, counter: A, inv: A, pos: A, pacc: A, pm: A, pl: A) !?A {
+    const wo = &ly.wo_a;
+    if (!mlx.streamIsGpu(sc.s) or wo.s.ctx == null or wo.qp.mode != .mxfp8 or wo.qp.bits != 8 or wo.qp.group_size != 32) return null;
+    return launchRows(sc, kern, m.cfg.dsv4_rope_head_dim, m.act, .{ pacc, pm, pl, ly.sink, pos, inv, wo.w, wo.s }, counter);
 }
 
 // ── the kernel contract ──
@@ -583,7 +603,7 @@ test "dsv41 dec wo_a: shapes the kernel was not built for are declined" {
     try testing.expect(plan(6, 64, 8, 512, 8, 1024, RD, true) != null);
     try testing.expect(plan(6, 64, 8, 512, 8, 1000 + 24, RD, true) != null);
     try testing.expect(plan(6, 64, 8, 512, 8, 96, RD, true) == null);
-    try testing.expect(plan(7, 64, 4, 512, 8, 1024, RD, false) == null);
+    try testing.expect(plan(decode.max_rows + 1, 64, 4, 512, 8, 1024, RD, false) == null);
     try testing.expect(plan(0, 64, 4, 512, 8, 1024, RD, false) == null);
     try testing.expect(plan(1, 64, 9, 512, 8, 1024, RD, false) == null);
     try testing.expect(plan(1, 64, 4, 256, 8, 1024, RD, false) == null);
@@ -612,6 +632,42 @@ test "dsv41 dec wo_a: the declared launches are the wrapper's, byte for byte" {
         defer a.free(mine);
         const got = (try launch(&sc, kern, RD, act, c.args[0..8].*, c.args[8], null)) orelse return error.Declined;
         try testing.expectEqualSlices(u8, mine, try c.rig.bytesOf(&.{got}));
+    }
+}
+
+test "dsv41 dec wo_a: rows given their own positions (`launchRows`) are a block's rows, byte for byte" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const kern = try build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    var sc = Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    for ([_]bool{ false, true }) |nax| {
+        if (nax and !device.naxAvailable()) continue;
+        const c = try a.create(kit.Case(WoA));
+        defer {
+            c.deinit();
+            a.destroy(c);
+        }
+        c.* = .init(a, if (nax) &decl_nax else &decl, .{ .nax = nax });
+        const R: usize = if (nax) decode.max_rows else 3;
+        try testing.expect(try c.prepare(.{ .rows = R, .n = 128, .k = HPG * HD }, .random, 11));
+        const block = (try launch(&sc, kern, RD, act, c.args[0..8].*, c.args[8], null)) orelse return error.Declined;
+        // The block's rows stand at p0, p0 + 1, …: the same positions, a row at a time.
+        const p0: i32 = @intCast((WoA.Params{}).p0);
+        var pos: [decode.max_rows]i32 = undefined;
+        for (pos[0..R], 0..) |*o, r| o.* = p0 + @as(i32, @intCast(r));
+        var ins = c.args[0..8].*;
+        ins[4] = try sc.ints(pos[0..R], &.{ci(R)});
+        const rows = (try launchRows(&sc, kern, RD, act, ins, c.args[8])) orelse return error.Declined;
+        const want = try a.dupe(u8, try c.rig.bytesOf(&.{block}));
+        defer a.free(want);
+        try testing.expectEqualSlices(u8, want, try c.rig.bytesOf(&.{rows}));
+        // Other positions change the roped tail.
+        pos[R - 1] += 977;
+        ins[4] = try sc.ints(pos[0..R], &.{ci(R)});
+        const moved = (try launchRows(&sc, kern, RD, act, ins, c.args[8])) orelse return error.Declined;
+        try testing.expect(!std.mem.eql(u8, want, try c.rig.bytesOf(&.{moved})));
     }
 }
 

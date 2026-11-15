@@ -22,8 +22,11 @@ const dsv41 = @import("../deepseek_v41.zig");
 
 const A = mlx.mlx_array;
 
-/// The most rows a decode kernel serves in one launch: a plain step, or a DSpark verify block.
-pub const max_rows = 6;
+/// The most rows a decode kernel serves in one launch: a DSpark verify block (6), or one row each of up to 8 requests
+/// decoding together (`batchedSolo`). The kernels size their threadgroup memory by the launch's own rows.
+pub const max_rows = 8;
+/// The affine MoE launches (`moe_up`, `moe_down`) keep a verify block's rows: `moe_down` sizes its tiles by this.
+pub const affine_rows = 6;
 
 /// What this machine streams from memory in practice (a plain reduction on the M5 Ultra), bytes a microsecond.
 pub const stream_bytes_per_us: f64 = 1.065e6;

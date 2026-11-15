@@ -4,6 +4,7 @@
 // of a tile's HPG threadgroups to arrive adds them in head order. NAX: a simdgroup takes 32 rows on the matrix units
 // against the head rounded to bf16 (as the chain hands it to wo_a); else NR rows on the vector units against the f32 head,
 // each row's split weights and total computed once into threadgroup memory and a thread's split loads issued first.
+// Row m stands at meta[0] + m (one request's consecutive rows), or with PR at meta[m] (rows of different requests).
 const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
 const int tid = int(thread_position_in_threadgroup.x);
 const int h = int(threadgroup_position_in_grid.y), g = h / HPG, hh = h % HPG;
@@ -50,7 +51,7 @@ if constexpr (NAX) {
     for (int j = 0; j < S; ++j) o += ((const device float2*)(pacc + (base + j) * D))[p] * coef[m * (S + 1) + j];
     o *= coef[m * (S + 1) + S];
     if (p >= (D - RD) / 2) {
-      const float pos = float(meta[0] + m);
+      const float pos = float(PR ? meta[m] : meta[0] + m);
       const float t0 = pos * (1.0f / periods[p - (D - RD) / 2]);
       const float c0 = metal::fast::cos(t0), n0 = metal::fast::sin(t0);
       o = float2(o.x * c0 - o.y * n0, o.x * n0 + o.y * c0);
@@ -104,7 +105,7 @@ if constexpr (NAX) {
     o /= coef[m * (S + 1) + S];
     if (q >= (D - RD) / 4) {
       const int p = 2 * q - (D - RD) / 2;
-      const float pos = float(meta[0] + m);
+      const float pos = float(PR ? meta[m] : meta[0] + m);
       const float t0 = pos * (1.0f / periods[p]), t1 = pos * (1.0f / periods[p + 1]);
       const float c0 = metal::fast::cos(t0), n0 = metal::fast::sin(t0), c1 = metal::fast::cos(t1), n1 = metal::fast::sin(t1);
       o = float4(o.x * c0 - o.y * n0, o.x * n0 + o.y * c0, o.z * c1 - o.w * n1, o.z * n1 + o.w * c1);

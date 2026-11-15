@@ -46,7 +46,7 @@ fn ci(v: usize) c_int {
     return @intCast(v);
 }
 
-/// The gate/up half of `h2`'s MoE (`h2` `[R, K]`, `idx` `[R, k]` u32, `wts` `[R, k]` f32; R <= `decode.max_rows`) as
+/// The gate/up half of `h2`'s MoE (`h2` `[R, K]`, `idx` `[R, k]` u32, `wts` `[R, k]` f32; R <= `decode.affine_rows`) as
 /// `[R, k + 1, N]`: slot j < k the clamped SwiGLU of row r's j-th expert times its weight, slot k the shared expert's.
 /// Null where the layer's formats are not the served ones (routed affine 2 or 3 bits, group 64 or 128; shared mxfp8) or the shape is not.
 pub fn moeUp(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernel, ly: *const dsv41.Layer, h2: A, idx: A, wts: A) !?A {
@@ -61,7 +61,7 @@ pub fn moeUp(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernel, ly: *co
     const topk: usize = @intCast(is[1]);
     const k: usize = @intCast(hs[1]);
     const bits = gu.qp.bits;
-    if (rows < 1 or rows > decode.max_rows or topk < 1 or rows * topk > 64 or k % 1024 != 0) return null;
+    if (rows < 1 or rows > decode.affine_rows or topk < 1 or rows * topk > 64 or k % 1024 != 0) return null;
     const gs = gu.qp.group_size;
     if (gu.qp.mode != .affine or (gs != 64 and gs != 128) or (bits != 2 and bits != 3) or gw[2] != ci(k * bits / 32) or @rem(gw[1], 2) != 0) return null;
     if (sgu.qp.mode != .mxfp8 or sgu.qp.bits != 8 or sgu.qp.group_size != 32) return null;
@@ -140,7 +140,7 @@ const MoeUp = struct {
     pub const Params = struct { bits: u32, gs: u32 = 64, experts: usize = 8, lim: f64 = 10 };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
-        if (s.rows == 0 or s.rows > decode.max_rows or s.n == 0 or s.k == 0 or s.k % 1024 != 0) return null;
+        if (s.rows == 0 or s.rows > decode.affine_rows or s.n == 0 or s.k == 0 or s.k % 1024 != 0) return null;
         var g = metal.Geometry{ .grid = .{ ci(32 * s.n * (TOPK * s.rows + 1)), 1, 1 }, .tg = .{ tg_threads, 1, 1 } };
         g.out(&.{ ci(s.rows), TOPK + 1, ci(s.n) }, act);
         g.int("R", s.rows);
@@ -291,7 +291,7 @@ pub fn register(set: *kc.Set) !void {
             .mids = 1,
             .out = .bf16,
             .tiles = .{ .{}, .{}, .{ .size = 1024, .step = 1024, .min = 1024 } },
-            .served = &.{ .{ .rows = 1, .n = 64, .k = 5120 }, .{ .rows = 3, .n = 17, .k = 5120 }, .{ .rows = decode.max_rows, .n = 64, .k = 5120 } },
+            .served = &.{ .{ .rows = 1, .n = 64, .k = 5120 }, .{ .rows = 3, .n = 17, .k = 5120 }, .{ .rows = decode.affine_rows, .n = 64, .k = 5120 } },
             .sums = .{ .f16 = 30, .bf16 = 30, .why = "a wrong sum's activation tends to 0, so a miss tops out near 1 / the bound" },
         });
     };

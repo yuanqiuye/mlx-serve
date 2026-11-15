@@ -32,7 +32,7 @@ fn tgBytes(K: usize, rows: usize) usize {
 /// The widest reduction axis whose threadgroup memory fits the 32 KiB every Apple GPU grants.
 pub const max_k = blk: {
     var k: usize = 128;
-    while (tgBytes(k + 128, decode.max_rows) <= 32 * 1024) k += 128;
+    while (tgBytes(k + 128, decode.affine_rows) <= 32 * 1024) k += 128;
     break :blk k;
 };
 
@@ -69,7 +69,7 @@ pub fn moeDown(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, rb: usize, dow
     const K = dims(act, 2);
     const N = dims(x1, 2);
     const nt = rb * (K / 128);
-    if (R < 1 or R > decode.max_rows or dims(act, 1) != TOPK + 1 or dims(x1, 0) != R or dims(x1, 1) != HC or dims(idx, 0) != R or dims(idx, 1) != TOPK) return null;
+    if (R < 1 or R > decode.affine_rows or dims(act, 1) != TOPK + 1 or dims(x1, 0) != R or dims(x1, 1) != HC or dims(idx, 0) != R or dims(idx, 1) != TOPK) return null;
     if (K == 0 or K % 128 != 0 or K > max_k or N % rb != 0 or sp.post.ctx == null or sp.comb.ctx == null) return null;
     const bits = down.qp.bits;
     const gs = down.qp.group_size;
@@ -118,7 +118,7 @@ fn probeOnce(gpa: std.mem.Allocator, kern: mlx.mlx_fast_metal_kernel, rb: usize,
     defer sc.deinit();
     const down: dsv41.Bank = .{ .w = try sc.zeros(&.{ 1, ci(N), ci(K * 3 / 32) }, .uint32), .s = try sc.zeros(&.{ 1, ci(N), ci(K / 64) }, .bfloat16), .b = try sc.zeros(&.{ 1, ci(N), ci(K / 64) }, .bfloat16), .qp = .{ .bits = 3, .group_size = 64 } };
     const shared: dsv41.Lin = .{ .w = try sc.zeros(&.{ ci(N), ci(K / 4) }, .uint32), .s = try sc.zeros(&.{ ci(N), ci(K / 32) }, .uint8), .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
-    const R = decode.max_rows;
+    const R = decode.affine_rows;
     const sp: dsv41.Split = .{ .pre = none, .post = try sc.zeros(&.{ R, HC }, .float32), .comb = try sc.zeros(&.{ R, HC, HC }, .float32) };
     const y = (try moeDown(&sc, kern, rb, &down, &shared, try sc.zeros(&.{ R, TOPK + 1, ci(K) }, .bfloat16), try sc.zeros(&.{ R, TOPK }, .uint32), try sc.zeros(&.{ R, HC, ci(N) }, .bfloat16), &sp)) orelse return error.Declined;
     try mlx.check(mlx.mlx_array_eval(y));
@@ -173,7 +173,7 @@ fn truthOf(sc: *dsv41.Scope, ly: *const dsv41.Layer, act: A, picked: []const u32
     const dq = try dequant(sc, bank.w, bank.s, bank.b, bank.qp.bits, bank.qp.group_size, "affine");
     const dsh = try dequant(sc, ly.shared[2].w, ly.shared[2].s, none, 8, 32, "mxfp8");
     const act32 = try sc.astype(act, .float32);
-    var ys: [decode.max_rows]A = undefined;
+    var ys: [decode.affine_rows]A = undefined;
     for (0..R) |r| {
         const sel = try sc.take(dq, try sc.keep(mlx.mlx_array_new_data(picked[r * TOPK ..].ptr, &[_]c_int{TOPK}, 1, .uint32)), 0);
         const a = try sc.reshape(try sc.slice(try sc.slice(act32, 0, r, r + 1), 1, 0, TOPK), &.{ TOPK, ci(K), 1 });
@@ -197,7 +197,7 @@ fn checkRows(gpa: std.mem.Allocator, fx: *fixture.Fixture, li: usize, kern: mlx.
     const act = try sc.keep(try fx.normal(&.{ ci(rows), TOPK + 1, ci(K) }, .bfloat16, 0, 0.5));
     const x1 = try sc.keep(try fx.stream(rows));
     const sp: dsv41.Split = .{ .pre = none, .post = try sc.keep(try fx.uniform(&.{ ci(rows), HC }, 0, 2)), .comb = try sc.keep(try fx.uniform(&.{ ci(rows), HC, HC }, 0, 0.5)) };
-    var pk: [decode.max_rows * TOPK]u32 = undefined;
+    var pk: [decode.affine_rows * TOPK]u32 = undefined;
     var prng = std.Random.DefaultPrng.init(li * 64 + rows);
     picks(prng.random(), rows, m.cfg.num_experts, pool, &pk);
     const idx = try sc.keep(mlx.mlx_array_new_data(&pk, &[_]c_int{ ci(rows), TOPK }, 2, .uint32));
@@ -270,7 +270,7 @@ test "dsv41 dec moe_down: declines what it does not serve and runs what it does"
     defer sc.deinit();
     const y = (try serve(&sc, kern, 32, .{})) orelse return error.Declined;
     try mlx.check(mlx.mlx_array_eval(y));
-    try std.testing.expect((try serve(&sc, kern, 32, .{ .rows = decode.max_rows + 1 })) == null);
+    try std.testing.expect((try serve(&sc, kern, 32, .{ .rows = decode.affine_rows + 1 })) == null);
     try std.testing.expect((try serve(&sc, kern, 32, .{ .bits = 4 })) == null);
     try std.testing.expect((try serve(&sc, kern, 32, .{ .shared_mode = .affine })) == null);
     try std.testing.expect((try serve(&sc, kern, 32, .{ .x_dt = .float32 })) == null);
@@ -414,9 +414,9 @@ test "dsv41 dec moe_down: ubench" {
         var idxs: [steps]A = undefined;
         var distinct: f64 = 0;
         for (&idxs) |*ix| {
-            var pk: [decode.max_rows * TOPK]u32 = undefined;
+            var pk: [decode.affine_rows * TOPK]u32 = undefined;
             picks(prng.random(), rows, E, cfg[1], &pk);
-            var seen: [decode.max_rows * TOPK]u32 = undefined;
+            var seen: [decode.affine_rows * TOPK]u32 = undefined;
             var n: usize = 0;
             for (pk[0 .. rows * TOPK]) |e| if (std.mem.indexOfScalar(u32, seen[0..n], e) == null) {
                 seen[n] = e;
@@ -426,9 +426,9 @@ test "dsv41 dec moe_down: ubench" {
             ix.* = try sc.keep(mlx.mlx_array_new_data(&pk, &[_]c_int{ ci(rows), TOPK }, 2, .uint32));
         }
         distinct /= steps;
-        var pv: [decode.max_rows * HC]f32 = undefined;
+        var pv: [decode.affine_rows * HC]f32 = undefined;
         for (&pv, 0..) |*v, i| v.* = 0.4 + 0.05 * @as(f32, @floatFromInt(i % HC));
-        var cv: [decode.max_rows * HC * HC]f32 = undefined;
+        var cv: [decode.affine_rows * HC * HC]f32 = undefined;
         for (&cv, 0..) |*v, i| v.* = 0.2 + 0.01 * @as(f32, @floatFromInt(i % 7));
         var ctx: Chain = .{
             .sc = &sc,
@@ -484,7 +484,7 @@ fn depthK(s: Shape) usize {
     return s.k;
 }
 
-const down_l = metal.Launch{ .name = "dsv41_dec_moe_down", .inputs = &INS, .outputs = &.{"out"}, .source = SOURCE, .header = HEADER, .tg_bytes = tgBytes(max_k, decode.max_rows), .m1 = 640, .m2 = 640 };
+const down_l = metal.Launch{ .name = "dsv41_dec_moe_down", .inputs = &INS, .outputs = &.{"out"}, .source = SOURCE, .header = HEADER, .tg_bytes = tgBytes(max_k, decode.affine_rows), .m1 = 640, .m2 = 640 };
 
 /// Row `d` of the shared mxfp8 operand as float64: the `words` (e4m3 bytes, little endian) times the e8m0 `exps`.
 fn sharedAt(words: []const f64, exps: []const f64, d: usize, i: usize, k: usize) f64 {
@@ -500,7 +500,7 @@ const DownK = struct {
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         const nt = rows_per_tg * (s.k / 128);
-        if (s.rows < 1 or s.rows > decode.max_rows or s.n == 0 or s.n % rows_per_tg != 0 or s.k == 0 or s.k % 128 != 0 or s.k > max_k or p.experts < TOPK or p.experts > 64) return null;
+        if (s.rows < 1 or s.rows > decode.affine_rows or s.n == 0 or s.n % rows_per_tg != 0 or s.k == 0 or s.k % 128 != 0 or s.k > max_k or p.experts < TOPK or p.experts > 64) return null;
         var g = metal.Geometry{ .grid = .{ ci(s.n / rows_per_tg * nt), 1, 1 }, .tg = .{ ci(nt), 1, 1 } };
         g.out(&.{ ci(s.rows), HC, ci(s.n) }, adt);
         g.int("K", s.k);
