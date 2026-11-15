@@ -475,6 +475,9 @@ pub const Dsv41Model = struct {
     attn_f16: bool = true,
     idx_score_kernel: mlx.mlx_fast_metal_kernel,
     idx_tile_kernel: mlx.mlx_fast_metal_kernel,
+    /// The wide indexer's scores on the tensor units (`indexScoresNax`); null without them or under
+    /// `MLX_SERVE_DSV41_IDX_NAX=0`, and `idx_tile_kernel` serves.
+    idx_nax_kernel: ?mlx.mlx_fast_metal_kernel = null,
     gate_kernel: mlx.mlx_fast_metal_kernel,
     topk_kernel: mlx.mlx_fast_metal_kernel,
     dense_f32x_kernel: mlx.mlx_fast_metal_kernel,
@@ -554,6 +557,7 @@ pub const Dsv41Model = struct {
         if (self.moe_wt_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         _ = mlx.mlx_fast_metal_kernel_free(self.idx_score_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.idx_tile_kernel);
+        if (self.idx_nax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         _ = mlx.mlx_fast_metal_kernel_free(self.gate_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.route_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.hc_mix_kernel);
@@ -1393,6 +1397,8 @@ pub const IDX_SCORE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_scor
 /// cannot see is -inf without the work. `q` arrives in the keys' dtype: the rope kernel rounded it
 /// to that dtype before widening, so the cast is exact.
 pub const IDX_TILE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_tile.metal");
+pub const IDX_TILE_NAX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_tile_nax.metal");
+pub const IDX_TILE_NAX_HEADER = "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\nusing namespace mpp::tensor_ops;\n";
 
 /// Router logits `[L, E]` in f32 from bf16 rows: one simdgroup an expert,
 /// 8 inputs a lane per step.
@@ -1737,6 +1743,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     m.quant = opts.quant;
     defer m.quant = null;
     if (device.naxAvailable()) m.attn_gather = try GatherAttn.init();
+    if (device.naxAvailable() and (if (env.get(.MLX_SERVE_DSV41_IDX_NAX)) |v| v[0] != '0' else true))
+        m.idx_nax_kernel = try buildKernel("dsv41_index_tile_nax", &IDX_INS, &.{"scores"}, IDX_TILE_NAX_SOURCE, IDX_TILE_NAX_HEADER);
     if (mlx.metalKernelsAvailable()) m.moe_wt_kernel = try buildKernel("dsv41_moe_wt", &.{ "a", "wts" }, &.{"out"}, MOE_WT_SOURCE, "");
     const tp_worker = if (opts.tp) |t| t.rank != 0 else false;
     const worker = if (opts.pair) |p| p.worker else false;
@@ -1757,6 +1765,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         if (m.attn_gather) |*g| g.deinit();
         _ = mlx.mlx_fast_metal_kernel_free(m.idx_score_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.idx_tile_kernel);
+        if (m.idx_nax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         _ = mlx.mlx_fast_metal_kernel_free(m.gate_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.route_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.hc_mix_kernel);
@@ -3213,9 +3222,40 @@ pub fn attnWide(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, keys_w: A, wp: 
 pub fn indexScores(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: A, wscale: f32, p0: usize, ratio: usize) !A {
     const ih = dim(q, 1);
     const ihd = dim(q, 2);
-    if (dim(q, 0) > region_rows and dim(keys, 0) > 0 and ih % 8 == 0 and ih <= 128 and ihd % 8 == 0)
+    if (dim(q, 0) > region_rows and dim(keys, 0) > 0 and ih % 8 == 0 and ih <= 128 and ihd % 8 == 0) {
+        if (m.idx_nax_kernel) |k| if (ihd % 16 == 0 and mlx.mlx_array_dtype(keys) != .float32 and mlx.streamIsGpu(sc.s))
+            return indexScoresNax(sc, k, q, keys, weights, wscale, p0, ratio);
         return indexScoresTiled(sc, m, q, keys, weights, wscale, p0, ratio);
+    }
     return indexScoresScalar(sc, m, q, keys, weights, wscale, p0, ratio);
+}
+
+/// `indexScoresTiled`'s scores on the tensor units (`IDX_TILE_NAX_SOURCE`): a simdgroup owns 32 rows x 32 keys, each
+/// head's product accumulated in f32 by the matrix op, then relu, the head weight and the head sum in f32 in the tile
+/// kernel's order. Half-type keys of a head width that is a multiple of 16 and a head count that is a multiple of 8.
+/// The tile kernel's bits wherever a dot product is exact in f32, as the fp4 round trips' are; elsewhere only the
+/// order a dot product's terms are summed in differs.
+pub fn indexScoresNax(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, q: A, keys: A, weights: A, wscale: f32, p0: usize, ratio: usize) !A {
+    const L = dim(q, 0);
+    const nb = dim(keys, 0);
+    const dt = mlx.mlx_array_dtype(keys);
+    const meta = try sc.ints(&.{ @intCast(p0), @intCast(ratio) }, &.{2});
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(nb) }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci((nb + 63) / 64 * 128), ci((L + 63) / 64), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "IH", ci(dim(q, 1))));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "IHD", ci(dim(q, 2))));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    const inputs = [_]A{ try sc.astype(q, dt), keys, weights, meta, try sc.keep(mlx.mlx_array_new_data(&[_]f32{wscale}, &[_]c_int{1}, 1, .float32)) };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
 
 pub fn indexScoresTiled(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: A, wscale: f32, p0: usize, ratio: usize) !A {
@@ -8347,6 +8387,77 @@ test "dsv41 topk: a threadgroup the GPU refuses is halved until the kernel launc
     m.topk_tg = 4096; // above any Metal cap
     try probeTopkThreads(testing.allocator, &m);
     try testing.expect(m.topk_tg >= 32 and m.topk_tg <= 1024 and m.topk_tg % 32 == 0);
+}
+
+test "dsv41 index scores: the tensor units give the tile kernel's bits on fp4 round trips and its scores on any input" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    m.idx_tile_kernel = try buildKernel("dsv41_index_tile", &IDX_INS, &.{"scores"}, IDX_TILE_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_tile_kernel);
+    const nax = try buildKernel("dsv41_index_tile_nax", &IDX_INS, &.{"scores"}, IDX_TILE_NAX_SOURCE, IDX_TILE_NAX_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(nax);
+    const ih: usize = 32;
+    const ihd: usize = 128;
+    const ws: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(ihd * ih)));
+    // A span off the 32-row grid, keys off the 64-key grid, a start inside a block of keys, both ratios, and the edge of
+    // what a row sees inside the span.
+    const cases = [_][4]usize{ .{ 256, 4096, 8000, 2 }, .{ 250, 1000, 1757, 2 }, .{ 17, 333, 320, 1 }, .{ 64, 65, 100, 2 }, .{ 131, 5000, 4873, 1 } };
+    var prng = std.Random.DefaultPrng.init(41);
+    const rnd = prng.random();
+    const e2m1 = [_]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
+    for (cases) |c| {
+        const L, const nb, const p0, const ratio = c;
+        const qh = try gpa.alloc(f32, L * ih * ihd);
+        defer gpa.free(qh);
+        const kh = try gpa.alloc(f32, nb * ihd);
+        defer gpa.free(kh);
+        const wh = try gpa.alloc(f32, L * ih);
+        defer gpa.free(wh);
+        // The index queries and keys as the model makes them: fp4 values under one power-of-two scale every 32.
+        for ([_][]f32{ qh, kh }) |buf| {
+            var i: usize = 0;
+            while (i < buf.len) : (i += 32) {
+                const scale = std.math.ldexp(@as(f32, 1), rnd.intRangeAtMost(i32, -3, 3));
+                for (buf[i..][0..32]) |*v| v.* = e2m1[rnd.uintLessThan(usize, 8)] * scale * @as(f32, if (rnd.boolean()) 1 else -1);
+            }
+        }
+        for (wh) |*v| v.* = rnd.floatNorm(f32);
+        const q = try sc.keep(mlx.mlx_array_new_data(qh.ptr, &[_]c_int{ ci(L), ci(ih), ci(ihd) }, 3, .float32));
+        const keys = try sc.astype(try sc.keep(mlx.mlx_array_new_data(kh.ptr, &[_]c_int{ ci(nb), ci(ihd) }, 2, .float32)), .bfloat16);
+        const w = try sc.astype(try sc.keep(mlx.mlx_array_new_data(wh.ptr, &[_]c_int{ ci(L), ci(ih) }, 2, .float32)), .bfloat16);
+        const want = try hostF32(try indexScoresTiled(&sc, &m, q, keys, w, ws, p0, ratio));
+        defer gpa.free(want);
+        const got = try hostF32(try indexScoresNax(&sc, nax, q, keys, w, ws, p0, ratio));
+        defer gpa.free(got);
+        try testing.expectEqual(L * nb, got.len);
+        for (want, got) |a, b| try testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+    }
+    // Any bf16 rows: a dot product's terms are summed in another order, so the scores agree to its f32 rounding, and
+    // the keys a row does not see are the same ones.
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 6));
+    for (cases) |c| {
+        const L, const nb, const p0, const ratio = c;
+        var t: [3]A = undefined;
+        for ([_][]const c_int{ &.{ ci(L), ci(ih), ci(ihd) }, &.{ ci(nb), ci(ihd) }, &.{ ci(L), ci(ih) } }, &t, 0..) |sh, *o, i| {
+            var r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, if (i == 2) .float32 else .bfloat16, 0, 1, key, sc.s));
+            o.* = try sc.keep(r);
+        }
+        const q = try sc.astype(t[0], .float32);
+        const want = try hostF32(try indexScoresTiled(&sc, &m, q, t[1], t[2], ws, p0, ratio));
+        defer gpa.free(want);
+        const got = try hostF32(try indexScoresNax(&sc, nax, q, t[1], t[2], ws, p0, ratio));
+        defer gpa.free(got);
+        for (want, got) |a, b| {
+            if (std.math.isInf(a)) try testing.expectEqual(a, b) else try testing.expectApproxEqAbs(a, b, 1e-5 * @max(1.0, @abs(a)));
+        }
+    }
 }
 
 test "dsv41 index scores: the matrix kernel scores what the scalar kernel scores and picks its blocks, near-ties aside" {
