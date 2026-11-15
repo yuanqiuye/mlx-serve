@@ -11,6 +11,7 @@ const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
 const qwen4_ple = @import("../qwen4_exp/ple_table.zig");
 /// the tables read past the page cache through their blocks.
 const edir = @import("prompt/engram_direct.zig");
+const env = @import("../../env.zig");
 /// the Engram LRU a decode read takes its rows from, its misses
 /// read on a pool; a prompt grid's rows and the rounds' bonus rows go into it.
 const edec = @import("decode/engram_decode.zig");
@@ -294,13 +295,29 @@ pub const Table = struct {
     /// The table read past the page cache: a streamed bank's slot rows hold the memory the cache would (on a resident
     /// pack the cache serves a warm prompt's rows faster).
     pub fn readDirect(self: *Table) void {
+        edir.unmap(self.fd);
         edir.register(self.fd);
         self.direct = true;
+    }
+
+    /// The table's file mapped (`edir.map`): its rows copied out of the page cache as memory, where a pread a row was a
+    /// system call each. `MLX_SERVE_DSV41_ENGRAM_MAP=0` keeps the preads. The codes of a pack with no cache to spare
+    /// still go through `cfd` past the page cache (`pastCache`), which is never mapped.
+    pub fn mapFile(self: *Table) void {
+        if (self.direct or self.mode == .gguf) return;
+        if (env.get(.MLX_SERVE_DSV41_ENGRAM_MAP)) |v| if (v[0] == '0') return;
+        edir.map(self.fd);
+    }
+
+    /// Whether this read's rows are copies out of the map: faults on a mapping scale to about 32 threads, not 128.
+    fn mapsRows(self: *const Table) bool {
+        return edir.mapped(self.fd) and !self.past_cache.load(.acquire);
     }
 
     pub fn close(self: *Table) void {
         // the LRU let go of (its early reads in flight waited for).
         edec.forget(self.fd);
+        edir.unmap(self.fd);
         // The direct Engram reads: the descriptor's block registration dropped with it.
         edir.unregister(self.fd);
         crt.close(self.fd);
@@ -593,7 +610,7 @@ pub const Table = struct {
             }
         };
         var runs: Runs = .{ .t = self, .ids = ids, .w = w, .s = sc, .b = bi };
-        const parts = std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, @min(cap, @as(usize, GRID_THREADS)));
+        const parts = std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, @min(cap, @as(usize, if (self.mapsRows()) MAP_THREADS else GRID_THREADS)));
         var threads: [GRID_THREADS]?std.Thread = @splat(null);
         for (threads[1..parts], 1..) |*slot, k| slot.* = std.Thread.spawn(.{}, Runs.go, .{ &runs, k * n / parts, (k + 1) * n / parts }) catch null;
         runs.go(0, n / parts);
@@ -1004,6 +1021,9 @@ extern "c" fn dispatch_get_global_queue(identifier: isize, flags: usize) ?*anyop
 extern "c" fn dispatch_apply_f(iterations: usize, queue: ?*anyopaque, context: ?*anyopaque, work: *const fn (?*anyopaque, usize) callconv(.c) void) void;
 
 const PAR_ROWS_PER_THREAD = 16;
+/// Threads a mapped table's rows are read on: cold faults on one mapping ran fastest on 16 to 32 (150,000 rows: 58 ms
+/// on 32, 91 on 64, 282 on 128), cached rows are memory copies.
+const MAP_THREADS = 32;
 const PAR_THREADS = 32;
 
 /// The direct Engram reads: a prompt span's read threads when the reads go past the cache.
@@ -1419,6 +1439,50 @@ test "dsv41 engram: codes read past the page cache are the rows read through it"
     t.pastCache(false);
     try testing.expectEqual(t.fd, t.wfd());
     try testing.expect(cacheTight(24 << 30, 256 << 30) and !cacheTight(130 << 30, 256 << 30));
+}
+
+test "dsv41 engram: a mapped table's rows are the rows its preads read" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const ids = [_]u32{ 3, 0, 2, 2, 1 };
+    const sorted = [_]u32{ 0, 1, 2, 3 };
+    for ([_]bool{ false, true }) |affine| {
+        var td = testing.tmpDir(.{});
+        defer td.cleanup();
+        if (affine) try writeAffineFixture(io, td.dir, "language_model.") else try writeRawFp8Fixture(io, td.dir);
+        var buf: [512]u8 = undefined;
+        const dir = buf[0..try td.dir.realPath(io, &buf)];
+        var plain = try Table.open(testing.allocator, dir, 0, 1, 4, 64);
+        defer plain.close();
+        try testing.expect(!edir.mapped(plain.fd));
+        const want = try plain.read(testing.allocator, &ids);
+        defer want.deinit(testing.allocator);
+        const want_sorted = try plain.readSorted(testing.allocator, &sorted, GRID_THREADS);
+        defer want_sorted.deinit(testing.allocator);
+        // A table of its own (the first one's rows sit in the LRU under its descriptor), mapped.
+        var t = try Table.open(testing.allocator, dir, 0, 1, 4, 64);
+        defer t.close();
+        t.mapFile();
+        try testing.expect(edir.mapped(t.fd) and t.mapsRows());
+        const got = try t.read(testing.allocator, &ids);
+        defer got.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, want.w, got.w);
+        try testing.expectEqualSlices(u8, want.s, got.s);
+        try testing.expectEqualSlices(u8, want.b, got.b);
+        const got_sorted = try t.readSorted(testing.allocator, &sorted, GRID_THREADS);
+        defer got_sorted.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, want_sorted.w, got_sorted.w);
+        try testing.expectEqualSlices(u8, want_sorted.s, got_sorted.s);
+        try testing.expectEqualSlices(u8, want_sorted.b, got_sorted.b);
+        // A row past the table's end is refused, mapped or not.
+        try testing.expectError(error.EngramRead, t.readSorted(testing.allocator, &.{ 1, 4 }, GRID_THREADS));
+        // Set to read past the page cache, the table lets its map go.
+        t.readDirect();
+        try testing.expect(!edir.mapped(t.fd));
+        const direct = try t.readSorted(testing.allocator, &sorted, GRID_THREADS);
+        defer direct.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, want_sorted.w, direct.w);
+    }
 }
 
 test "dsv41 engram: a prompt grid read whole past the cache (a streamed bank's table) hands each span the span read's rows" {

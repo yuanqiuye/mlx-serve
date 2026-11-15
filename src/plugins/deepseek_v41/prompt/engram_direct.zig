@@ -29,6 +29,9 @@ const max_files = 8;
 const State = struct {
     files: [max_files]struct { fd: c_int, block: u64 } = @splat(.{ .fd = -1, .block = 0 }),
     n_files: usize = 0,
+    /// The tables' files mapped (`map`): fd, base and length.
+    maps: [max_files]struct { fd: c_int, base: [*]const u8, len: usize } = @splat(.{ .fd = -1, .base = undefined, .len = 0 }),
+    n_maps: usize = 0,
 };
 pub const shared_state = @import("../../../sdk/util/shared.zig").Shared(State, "dsv41_engram_direct", .{});
 pub inline fn ps() *State {
@@ -55,6 +58,47 @@ comptime {
     if (@sizeOf(Statfs) != 2168) @compileError("engram_direct: struct statfs is 2,168 bytes on Darwin");
 }
 
+/// At a table's open, for a file read through the page cache: the file mapped, so a row is copied out of memory.
+/// A pread a row is a system call each, and on one file the calls run one after another whatever the threads: 150,000
+/// row-sized reads of a 61 GB table took 260 ms on 8 to 128 threads alike, cold or warm (M5 Ultra); mapped they take
+/// about 60 ms cold on 16 to 32 threads and under 1 ms once the pages are cached. The pages are the ones the preads
+/// left in the page cache: the map adds no memory of its own. A registered (F_NOCACHE) file is never mapped.
+pub fn map(fd: c_int) void {
+    if (comptime !builtin.os.tag.isDarwin()) return;
+    if (blockOf(fd) != 0 or mapOf(fd) != null or ps().n_maps == max_files) return;
+    const size = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (size <= 0) return;
+    const m = std.posix.mmap(null, @intCast(size), .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0) catch return;
+    // Rows are read one here, one there: no read-ahead around a fault.
+    _ = std.c.madvise(@ptrCast(m.ptr), m.len, std.c.MADV.RANDOM);
+    ps().maps[ps().n_maps] = .{ .fd = fd, .base = m.ptr, .len = m.len };
+    ps().n_maps += 1;
+}
+
+/// The file's map let go of (its close, or a table set to read past the page cache).
+pub fn unmap(fd: c_int) void {
+    if (comptime !builtin.os.tag.isDarwin()) return;
+    var i: usize = 0;
+    while (i < ps().n_maps) {
+        if (ps().maps[i].fd == fd) {
+            const m = ps().maps[i];
+            std.posix.munmap(@alignCast(@constCast(m.base[0..m.len])));
+            ps().maps[i] = ps().maps[ps().n_maps - 1];
+            ps().n_maps -= 1;
+        } else i += 1;
+    }
+}
+
+fn mapOf(fd: c_int) ?[]const u8 {
+    for (ps().maps[0..ps().n_maps]) |m| if (m.fd == fd) return m.base[0..m.len];
+    return null;
+}
+
+/// Whether `fd`'s reads are copies out of its map.
+pub fn mapped(fd: c_int) bool {
+    return mapOf(fd) != null;
+}
+
 /// At a table's close: its file let go of (a later file may take the same descriptor).
 pub fn unregister(fd: c_int) void {
     var i: usize = 0;
@@ -76,6 +120,11 @@ fn blockOf(fd: c_int) u64 {
 pub fn readRow(fd: c_int, dst: []u8, off: u64) bool {
     // Windows opens no Engram table (`engram.Table.open`).
     if (comptime builtin.os.tag == .windows) return false;
+    if (mapOf(fd)) |m| {
+        if (off > m.len or dst.len > m.len - off) return false;
+        @memcpy(dst, m[@intCast(off)..][0..dst.len]);
+        return true;
+    }
     const block = blockOf(fd);
     const lo = if (block > 0) off / block * block else off;
     const hi = if (block > 0) std.mem.alignForward(u64, off + dst.len, block) else off + dst.len;

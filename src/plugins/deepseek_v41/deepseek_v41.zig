@@ -2125,7 +2125,10 @@ fn initEngram(m: *Dsv41Model, w: *Weights, dir: []const u8) !void {
             .qk = prod,
             .table = try engram.Table.open(m.gpa, dir, k, l, c.dsv41_engram_rows[k], c.dsv41_engram_head_dim),
         };
-        if (c.dsv41_streamed) m.engrams[k].table.readDirect() else m.engrams[k].table.openCodes();
+        if (c.dsv41_streamed) m.engrams[k].table.readDirect() else {
+            m.engrams[k].table.openCodes();
+            m.engrams[k].table.mapFile();
+        }
         opened += 1;
     }
 }
