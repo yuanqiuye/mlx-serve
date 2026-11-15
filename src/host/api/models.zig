@@ -258,7 +258,7 @@ pub fn renderModelEntry(
         const model_id_json = try jsonEscape(allocator, if (entry.id.len > 0) entry.id else config.model_type);
         defer allocator.free(model_id_json);
         const drafter_loaded = entry.hasDrafter();
-        const mtp_loaded = entry.mtp != null or if (entry.engine) |e| e.kind == .llama and e.caps().drafts else false;
+        const mtp_loaded = entry.mtp != null or mf.dspark_stages > 0 or if (entry.engine) |e| e.kind == .llama and e.caps().drafts else false;
         const drafter_path_json = if (drafter_loaded)
             try jsonEscape(allocator, entry.drafter_path)
         else

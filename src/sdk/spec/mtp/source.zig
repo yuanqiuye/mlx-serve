@@ -188,6 +188,31 @@ fn indexJsonHasQwen4Mtp(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Di
         std.mem.indexOf(u8, bytes, qwen4_root_mtp_marker) != null;
 }
 
+/// DeepSeek's DSpark stages (`language_model.mtp.<n>.*`) are the checkpoint's own layers, loaded by the arch itself,
+/// never through `resolveMtpSource`.
+const dspark_stage_marker = "\"language_model.mtp.0.";
+
+/// True when the shard index lists DSpark stage 0. The caller decides the arch: a DeepSeek V4 pack carries the same
+/// names and loads them only on `--dspark`, V4.1 loads them unless its `mtp` setting is off.
+pub fn indexJsonHasDsparkStages(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
+    const bytes = readDirFileAlloc(io, allocator, dir, "model.safetensors.index.json", checkpoint_header_limit) orelse return false;
+    defer allocator.free(bytes);
+    return std.mem.indexOf(u8, bytes, dspark_stage_marker) != null;
+}
+
+test "DSpark stages are read from the shard index, and are no generic head" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testing.expect(!indexJsonHasDsparkStages(io, allocator, tmp.dir));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"language_model.mtp.0.norm.weight\":\"model-00002.safetensors\"}}" });
+    try testing.expect(indexJsonHasDsparkStages(io, allocator, tmp.dir));
+    try testing.expect(!dirAdvertisesMtp(io, allocator, tmp.dir));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"language_model.mtp.fc_hidden.weight\":\"model-00002.safetensors\"}}" });
+    try testing.expect(!indexJsonHasDsparkStages(io, allocator, tmp.dir));
+}
+
 /// Advertisement probe: ANY head the server can run, including qwen4's.
 pub fn dirAdvertisesMtp(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
     return resolveMtpSource(io, allocator, dir) != null or indexJsonHasQwen4Mtp(io, allocator, dir);

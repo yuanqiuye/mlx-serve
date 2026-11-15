@@ -1218,6 +1218,7 @@ pub fn rerankSelectBatched(
 pub const sidecar_rel_paths = mtp_source.sidecar_rel_paths;
 pub const MtpSource = mtp_source.MtpSource;
 pub const dirAdvertisesMtp = mtp_source.dirAdvertisesMtp;
+pub const indexJsonHasDsparkStages = mtp_source.indexJsonHasDsparkStages;
 pub const resolveMtpSidecarInDir = mtp_source.resolveMtpSidecarInDir;
 const checkpoint_header_limit = mtp_source.checkpoint_header_limit;
 const mtpShardsFromIndexJson = mtp_source.mtpShardsFromIndexJson;

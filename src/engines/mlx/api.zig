@@ -190,6 +190,7 @@ fn supportsVideo(lm: *const LoadedModel) bool {
 fn facts(lm: *const LoadedModel, out: *host.Facts) void {
     out.* = .{
         .has_mtp = lm.mtp != null,
+        .dspark_stages = if (lm.transformer) |t| @intCast(t.dsparkStages()) else 0,
         .has_transformer = lm.transformer != null,
         .module_owned = if (lm.transformer) |t| t.ownsModuleDecodeState() else false,
         .images = if (lm.vision_encoder) |ve| ve.supportsImages() else false,

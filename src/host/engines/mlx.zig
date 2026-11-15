@@ -103,6 +103,8 @@ pub const PluginStub = struct { shell: abi_plugin.Shell, caps: abi_plugin.Caps, 
 /// What the host reads about a loaded MLX model.
 pub const Facts = struct {
     has_mtp: bool = false,
+    /// DeepSeek's own DSpark draft stages loaded on the model (`Transformer.dsparkStages`).
+    dspark_stages: u32 = 0,
     has_transformer: bool = false,
     /// The model keeps per-request decode state outside the KV cache (no prompt logprobs, no prefix reuse).
     module_owned: bool = false,

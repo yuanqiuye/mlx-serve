@@ -949,7 +949,10 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
     var meta = parseStubMeta(allocator, bytes, sniff.present);
     if (mlx_engine.api().plugin_stub(io, allocator, trimmed, bytes)) |st| applyServedStub(&meta, st);
     meta.has_thinking = meta.has_chat and sniff.thinking;
-    meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
+    // DeepSeek V4.1 drafts with its own DSpark stages by default: the same per-model `mtp` / `mtp_acceptance` settings
+    // steer them, so the listing advertises them like a head (the app shows those rows only where one exists).
+    meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir) or
+        (std.mem.indexOf(u8, bytes, "\"deepseek_v41\"") != null and mtp.indexJsonHasDsparkStages(io, allocator, dir));
     // A sentence-transformers pooling sidecar marks embedding capability even
     // when config.json says nothing (the load path parses its mode; the stub
     // only needs existence). Issue #116.
@@ -2170,6 +2173,15 @@ test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
     try tmp.dir.writeFile(io, .{ .sub_path = "m/model.safetensors.index.json", .data =
         \\{"weight_map":{"language_model.mtp.fc_hidden.weight":"model-00002.safetensors"}}
     });
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
+    // DeepSeek V4.1's DSpark stages load by default; V4's only on `--dspark`.
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/model.safetensors.index.json", .data =
+        \\{"weight_map":{"language_model.mtp.0.norm.weight":"model-00002.safetensors"}}
+    });
+    try std.testing.expect(!readStubMeta(io, allocator, model_dir).has_mtp);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{\"model_type\":\"deepseek_v4\",\"hidden_size\":8}" });
+    try std.testing.expect(!readStubMeta(io, allocator, model_dir).has_mtp);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{\"model_type\":\"deepseek_v41\",\"hidden_size\":8}" });
     try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
 }
 
