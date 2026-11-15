@@ -292,6 +292,11 @@ pub fn initWithOptions(
             .exact => unreachable,
         }
     }
+    if (dspark_active and dspark_stochastic) switch (options.mtp_acceptance) {
+        .typical => |cfg| log.info("  [dspark-accept] typical delta={d:.3} NOT distribution-exact\n", .{cfg.delta}),
+        .tokenv3 => |alpha| log.info("  [dspark-accept] TokenV3 alpha={d:.3} NOT distribution-exact\n", .{alpha}),
+        .exact => {},
+    };
     if (mtp_active and options.mtp_greedy_tail and sampling.temperature > 0.01 and !mtpDraftGreedyFor(sampling))
         log.info("  [mtp-draft] greedy tail engaged: depth 0 samples, later depths take the head's argmax\n", .{});
     var mtp_cache: ?MtpCacheRef = null;
@@ -979,6 +984,7 @@ pub fn initWithOptions(
             .pld_enabled = pld_active,
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
+            .dspark_accept = if (dspark_active) options.mtp_acceptance else .exact,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
             .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| dsparkPolicy(xfm.dspark_plain, xfm.dspark_ladder, if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0) else null else null,
             .drafter = if (drafter_active) options.drafter else null,

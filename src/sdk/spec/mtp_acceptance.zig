@@ -31,6 +31,9 @@ pub fn fromName(s: []const u8) ?Mode {
     if (std.mem.eql(u8, s, "exact")) return .exact;
     if (std.mem.eql(u8, s, "typical")) return .{ .typical = .{ .delta = DEFAULT_TYPICAL_DELTA } };
     if (std.mem.eql(u8, s, "tokenv3")) return .{ .tokenv3 = DEFAULT_TOKENV3_ALPHA };
+    // `typical:0.4`, `tokenv3:0.9`: the mode at a threshold of the setting's own (what `--mtp-typical` / `--mtp-tokenv3` take).
+    if (std.mem.startsWith(u8, s, "typical:")) return parse(s["typical:".len..], null) catch null;
+    if (std.mem.startsWith(u8, s, "tokenv3:")) return parse(null, s["tokenv3:".len..]) catch null;
     return null;
 }
 
@@ -163,4 +166,15 @@ test "TokenV3 deferred path uses pi over q and stops at first rejection" {
     var rng = std.Random.DefaultPrng.init(1);
     const accepted = tokenV3Prefix(&.{ 0.66, 0.007, 0.8 }, &.{ 0.1, 0.7, 0.1 }, &.{ false, true, false }, &rng);
     try testing.expectEqual(@as(u32, 1), accepted);
+}
+
+test "fromName: a mode by name at its default threshold, or with a threshold of its own" {
+    try testing.expect(fromName("exact").? == .exact);
+    try testing.expectEqual(DEFAULT_TYPICAL_DELTA, fromName("typical").?.typical.delta);
+    try testing.expectEqual(@as(f32, 0.4), fromName("typical:0.4").?.typical.delta);
+    try testing.expectEqual(@as(f32, 0.9), fromName("tokenv3:0.9").?.tokenv3);
+    try testing.expect(fromName("typical:0") == null);
+    try testing.expect(fromName("typical:x") == null);
+    try testing.expect(fromName("tokenv3:1.5") == null);
+    try testing.expect(fromName("fast") == null);
 }

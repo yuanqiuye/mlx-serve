@@ -265,6 +265,9 @@ pub const Generator = struct {
     /// Installed verifier route; selected once at init, not checked per token.
     mtp_accept_graph: MtpGraphFn = mtpBatchedExactGraph,
     mtp_accept_prefix: mtp_acceptance.PrefixFn = mtp_acceptance.exactPrefix,
+    /// How a sampled DSpark round keeps its drafts (`stochasticVerdict`): exact (each draft with the probability the
+    /// request's density gives it), or the model's lossy `mtp_acceptance` (typical, TokenV3), as the MTP head's rounds.
+    dspark_accept: mtp_acceptance.Mode = .exact,
     mtp_accept_param: f32 = 0,
     /// A sampled request drafts only depth 0 from the draft sampler, every later depth by argmax.
     mtp_greedy_tail: bool = false,

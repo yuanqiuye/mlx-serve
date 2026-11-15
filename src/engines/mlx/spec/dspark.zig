@@ -23,6 +23,9 @@ const SamplingParams = @import("../sampling/params.zig").SamplingParams;
 const capAcceptedForTokenBudget = @import("verify.zig").capAcceptedForTokenBudget;
 const dsparkCopyLen = @import("verify.zig").dsparkCopyLen;
 const mtpBatchedAcceptGraph = @import("mtp/batched_graph.zig").mtpBatchedAcceptGraph;
+const mtpBatchedTypicalGraph = @import("mtp/batched_graph.zig").mtpBatchedTypicalGraph;
+const mtpBatchedTokenV3Graph = @import("mtp/batched_graph.zig").mtpBatchedTokenV3Graph;
+const mtp_acceptance = @import("../../../sdk/spec/mtp_acceptance.zig");
 const mtpSerialOneToken = @import("mtp/serial.zig").mtpSerialOneToken;
 const probsAllPositions = @import("../sampling/spec_sampling.zig").probsAllPositions;
 const seedKey = @import("../sampling/lazy.zig").seedKey;
@@ -246,6 +249,53 @@ fn pinRowsDiag() u32 {
     return pin_rows_diag.?;
 }
 
+var accept_trace: ?bool = null;
+/// The diag `dsv41-accept-trace`: every sampled round logs, per draft position, the trunk's and the draft's highest
+/// logits (40 each), for an offline estimate of what other exact acceptance rules would keep.
+fn acceptTrace() bool {
+    if (accept_trace == null) accept_trace = env.get(.DSV41_ACCEPT_TRACE) != null;
+    return accept_trace.?;
+}
+
+const TRACE_TOP = 40;
+fn topOf(row: []const f32, ids: *[TRACE_TOP]u32, vals: *[TRACE_TOP]f32) void {
+    @memset(vals, -std.math.inf(f32));
+    @memset(ids, 0);
+    for (row, 0..) |v, i| {
+        if (!(v > vals[TRACE_TOP - 1])) continue;
+        var j: usize = TRACE_TOP - 1;
+        while (j > 0 and vals[j - 1] < v) : (j -= 1) {
+            vals[j] = vals[j - 1];
+            ids[j] = ids[j - 1];
+        }
+        vals[j] = v;
+        ids[j] = @intCast(i);
+    }
+}
+
+fn traceAccept(vl_g: mlx.mlx_array, verify: []const u32, draft_logits: []const f32, vocab: usize, accepted: u32) void {
+    const b = verify.len - 1;
+    if (b == 0 or draft_logits.len < b * vocab) return;
+    var vf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vf);
+    if (mlx.mlx_astype(&vf, vl_g, .float32, mlx.gpuStream()) != 0 or mlx.mlx_array_eval(vf) != 0) return;
+    const data = mlx.mlx_array_data_float32(vf) orelse return;
+    for (0..b) |k| {
+        var pi: [TRACE_TOP]u32 = undefined;
+        var pv: [TRACE_TOP]f32 = undefined;
+        var qi: [TRACE_TOP]u32 = undefined;
+        var qv: [TRACE_TOP]f32 = undefined;
+        topOf(data[k * vocab ..][0..vocab], &pi, &pv);
+        topOf(draft_logits[k * vocab ..][0..vocab], &qi, &qv);
+        var buf: [1400]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        for (pi, pv) |i, v| w.print("{d}:{d:.3} ", .{ i, v }) catch break;
+        w.writeAll("| ") catch {};
+        for (qi, qv) |i, v| w.print("{d}:{d:.3} ", .{ i, v }) catch break;
+        log.info("[accept-trace] k={d} draft={d} kept={d} {s}\n", .{ k, verify[k + 1], @intFromBool(k < accepted), w.buffered() });
+    }
+}
+
 var round_trace: ?bool = null;
 fn roundTrace() bool {
     if (round_trace == null) round_trace = env.get(.DSV41_ROUND_TRACE) != null;
@@ -284,7 +334,7 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     const pol = &self.dspark_pol.?;
     const st = &mdl.dec_state.?;
     const t1 = self.next_token_id;
-    var d = try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
+    var d = if (acceptTrace()) try dsv41_mod.dsparkDraftKeep(mdl, allocator, st, t1) else try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
     defer d.deinit(allocator);
     pol.ladder.sampleDraft(@as(f32, @floatFromInt(mdl.ds_draft_ns)) / @as(f32, std.time.ns_per_ms));
     // The model's own ladder and the rate the request runs at price the rows; what the choice expects, not what one
@@ -394,6 +444,7 @@ pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, com
     var pending = if (copy) |d| try mod.dsparkBeginWith(mdl, allocator, &mdl.dec_state.?, t1, d) else try mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
     defer pending.deinit();
     const verdict = try stochasticVerdict(self, pending.vl_g, pending.verify[0 .. pending.b + 1], mdl.vocab, accepted_cap);
+    if (acceptTrace()) if (copy) |d| traceAccept(pending.vl_g, pending.verify[0 .. pending.b + 1], d.logits, mdl.vocab, verdict.accepted);
     pending.lapVerify(mdl);
 
     const round = try mod.dsparkFinish(mdl, allocator, &mdl.dec_state.?, &pending, verdict.accepted, verdict.next_token);
@@ -457,7 +508,11 @@ pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const 
             draft_arrs[k] = mlx.mlx_array_new_data(&idv, &idshape, 1, .int32);
             n_arrs += 1;
         }
-        var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..b], null, b, sp, s);
+        var bg = switch (self.dspark_accept) {
+            .exact => try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..b], null, b, sp, s),
+            .typical => |cfg| try mtpBatchedTypicalGraph(probs_all, draft_arrs[0..b], null, b, cfg.delta, sp, s),
+            .tokenv3 => |alpha| try mtpBatchedTokenV3Graph(probs_all, draft_arrs[0..b], null, b, alpha, sp, s),
+        };
         defer bg.deinit();
 
         // ONE bounded sync: the accept vector + pre-sampled corrections
@@ -471,11 +526,25 @@ pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const 
         }
         try mlx.check(mlx.mlx_array_eval(bg.accept_p));
         const p_data = mlx.mlx_array_data_float32(bg.accept_p) orelse return error.MlxArrayDataNull;
-        while (accepted < b) {
-            const accept_prob: f32 = @min(1.0, p_data[accepted]);
-            const u: f32 = self.prng.random().float(f32);
-            if (u >= accept_prob) break;
-            accepted += 1;
+        switch (self.dspark_accept) {
+            .exact => while (accepted < b) {
+                const accept_prob: f32 = @min(1.0, p_data[accepted]);
+                const u: f32 = self.prng.random().float(f32);
+                if (u >= accept_prob) break;
+                accepted += 1;
+            },
+            // The lossy rules, as the MTP head's rounds apply them (`mtp_acceptance`): a draft stays while the trunk
+            // finds it typical (its probability over the row's entropy floor), or is not deferred (TokenV3).
+            .typical => {
+                try mlx.check(mlx.mlx_array_eval(bg.accept_q));
+                const floor = mlx.mlx_array_data_float32(bg.accept_q) orelse return error.MlxArrayDataNull;
+                accepted = mtp_acceptance.typicalPrefix(p_data[0..b], floor[0..b], null, &self.prng);
+            },
+            .tokenv3 => {
+                try mlx.check(mlx.mlx_array_eval(bg.accept_defer));
+                const deferred = mlx.mlx_array_data_bool(bg.accept_defer) orelse return error.MlxArrayDataNull;
+                accepted = mtp_acceptance.tokenV3Prefix(p_data[0..b], null, deferred[0..b], &self.prng);
+            },
         }
         // Pick the correction at the request-budget boundary and let
         // dsparkFinish roll module-owned state back to that same point.

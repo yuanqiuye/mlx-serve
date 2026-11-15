@@ -6864,6 +6864,14 @@ pub fn dsparkDraft(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) 
     return draftRows(m, gpa, st, t1, false);
 }
 
+/// `dsparkDraft` that also copies the draft's Markov-biased rows to the host (`DsparkDraft.logits`): the acceptance
+/// trace's (diag `dsv41-accept-trace`), never a served round's.
+pub fn dsparkDraftKeep(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) !DsparkDraft {
+    const t0 = monoUs();
+    defer m.ds_draft_ns = @intCast((monoUs() - t0) * 1000);
+    return draftRows(m, gpa, st, t1, true);
+}
+
 /// a draft launched ahead of its round
 /// (`dsparkDraftLaunch`), its graph built from the state as it stood and handed to the GPU, read by
 /// `dsparkDraftCollect`: the token and position it drafts from, the state's generation, and `draftRows`' three outputs
