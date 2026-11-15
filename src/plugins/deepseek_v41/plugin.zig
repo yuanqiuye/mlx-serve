@@ -274,6 +274,15 @@ fn head8Setting(settings_json: []const u8) ?bool {
     return parsed.value.lm_head_mxfp8;
 }
 
+/// `MLX_SERVE_DIAG=dsv41-act-f32`: the model's activations in f32, the reference a bf16 path's rounding is measured against.
+fn actDtype() mlx.mlx_dtype {
+    if (@import("../../env.zig").get(.DSV41_ACT_F32) != null) {
+        std.debug.print("deepseek_v41: activations in f32 (diag dsv41-act-f32): a reference run, slow\n", .{});
+        return .float32;
+    }
+    return .bfloat16;
+}
+
 fn mtpSetting(settings_json: []const u8) ?bool {
     if (settings_json.len == 0) return null;
     const S = struct { mtp: ?bool = null };
@@ -305,7 +314,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     defer if (quant) |q| q.close();
     // A pack an outside plugin reads has no tower reader here: its weights leave before the bank sizes its rows.
     if (quant != null) m.weights.dropPrefix("vision.");
-    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted() or (head8Setting(ctx.settings_json.slice()) orelse false), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant });
+    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .act = actDtype(), .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted() or (head8Setting(ctx.settings_json.slice()) orelse false), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant });
     errdefer m.mdl.deinit();
     // The fused Markov chain's kernels compiled now, not in the first draft.
     if (m.mdl.dspark) |*w| try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
