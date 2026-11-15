@@ -8533,15 +8533,24 @@ test "dsv41 topk: the kernel picks the k largest of each row in index order, tie
     var prng = std.Random.DefaultPrng.init(7);
     const r = prng.random();
     // The width a small GPU's probe settles on picks what 1024 threads pick.
-    for ([_]usize{ 1024, 256 }) |tg| for ([_][2]usize{ .{ 3, 3 }, .{ 100, 7 }, .{ 4100, 512 }, .{ 8192, 512 }, .{ 70000, 512 }, .{ 600, 600 } }) |nk| {
+    // From 32768 keys a row first tries the sampled threshold (two passes); 1100 picks are past what its survivors hold.
+    for ([_]usize{ 1024, 256 }) |tg| for ([_][2]usize{ .{ 3, 3 }, .{ 100, 7 }, .{ 4100, 512 }, .{ 8192, 512 }, .{ 70000, 512 }, .{ 600, 600 }, .{ 32768, 512 }, .{ 40000, 1024 }, .{ 40000, 1100 }, .{ 300000, 512 }, .{ 300000, 16 } }) |nk| {
         m.topk_tg = tg;
         const n, const k = nk;
-        const rows = 2;
+        const rows = 7;
         const v = try gpa.alloc(f32, rows * n);
         defer gpa.free(v);
         // Row 0 distinct values with some -inf; row 1 coarse values, so many ties.
         for (v[0..n], 0..) |*x, i| x.* = if (i % 13 == 4) -std.math.inf(f32) else r.float(f32) * 2 - 1;
-        for (v[n..], 0..) |*x, i| x.* = @floatFromInt(@as(i32, @intCast((i * 7919) % 5)) - 2);
+        for (v[n..][0..n], 0..) |*x, i| x.* = @floatFromInt(@as(i32, @intCast((i * 7919) % 5)) - 2);
+        // Rows 2, 3 rising and falling (a strided sample of a sorted row); row 4 all but a few -inf (fewer finite keys
+        // than picks at the longer rows' k: the -inf ties fill the rest); row 5 one value; row 6 a few thousand keys
+        // tied at the top (more ties than the survivors hold).
+        for (v[2 * n ..][0..n], 0..) |*x, i| x.* = @floatFromInt(i);
+        for (v[3 * n ..][0..n], 0..) |*x, i| x.* = @floatFromInt(n - i);
+        for (v[4 * n ..][0..n], 0..) |*x, i| x.* = if (i % 97 == 5) r.float(f32) else -std.math.inf(f32);
+        for (v[5 * n ..][0..n]) |*x| x.* = 0.25;
+        for (v[6 * n ..][0..n], 0..) |*x, i| x.* = if (i % 11 == 3) 9.0 else r.float(f32);
         const x = try sc.keep(mlx.mlx_array_new_data(v.ptr, &[_]c_int{ rows, ci(n) }, 2, .float32));
         const got = try hostI32(try topkRows(&sc, &m, x, k));
         defer gpa.free(got);
@@ -8561,6 +8570,41 @@ test "dsv41 topk: the kernel picks the k largest of each row in index order, tie
             for (want, got[row * k ..][0..k]) |w, g| try testing.expectEqual(@as(i32, @intCast(w)), g);
         }
     };
+}
+
+test "dsv41 topk ubench: 256 rows of a deep prompt's scores, 512 picks a row" {
+    if (!dkern.ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const iou = @import("../../sdk/util/io_util.zig");
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    m.topk_kernel = try buildKernel("dsv41_topk", &.{"x"}, &.{"out"}, TOPK_SOURCE, TOPK_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.topk_kernel);
+    m.topk_tg = 1024;
+    const rows = 256;
+    for ([_]usize{ 16384, 62500, 125000, 250000, 500000 }) |n| {
+        const v = try gpa.alloc(f32, rows * n);
+        defer gpa.free(v);
+        var state: u32 = 0x9E3779B9;
+        for (v) |*x| {
+            state = state *% 1664525 +% 1013904223;
+            x.* = @as(f32, @floatFromInt(state >> 8)) * (1.0 / 16777216.0) - 0.5;
+        }
+        const x = try sc.keep(mlx.mlx_array_new_data(v.ptr, &[_]c_int{ rows, ci(n) }, 2, .float32));
+        try mlx.check(mlx.mlx_array_eval(x));
+        var times: [7]f64 = undefined;
+        for (0..2 + times.len) |rep| {
+            const t0 = iou.nowUsMonotonic(io);
+            const out = try topkRows(&sc, &m, x, 512);
+            try mlx.check(mlx.mlx_array_eval(out));
+            if (rep >= 2) times[rep - 2] = @floatFromInt(iou.nowUsMonotonic(io) - t0);
+        }
+        std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+        const us = times[times.len / 2];
+        std.debug.print("[topk-ubench] {d} rows x {d} keys: {d:.2} ms ({d:.0} GB/s of scores a pass)\n", .{ rows, n, us / 1e3, @as(f64, @floatFromInt(rows * n * 4)) / us / 1e3 });
+    }
 }
 
 test "dsv41 topk: a threadgroup the GPU refuses is halved until the kernel launches" {
