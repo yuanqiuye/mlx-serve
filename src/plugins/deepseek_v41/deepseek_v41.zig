@@ -540,6 +540,11 @@ pub const Dsv41Model = struct {
     ds_prof_comp_sync_ns: u64 = 0,
     /// The last draft's time, host sync included (`DsparkProfile`).
     ds_draft_ns: u64 = 0,
+    /// The DSpark draft's own LM head: the trunk's dense head as 8-bit affine codes, beside it. A draft is a guess the
+    /// trunk verifies through the head as shipped, so the tokens a request emits are the dense head's either way,
+    /// and the draft's rows read half the head's bytes (1.3 ms of a 3.2 ms draft was the dense head's 1.3 GB).
+    /// Null where the trunk's head is already quantized, a plugin's, or `MLX_SERVE_DSV41_DRAFT_HEAD8` is not set to 1.
+    draft_head: ?Lin = null,
 
     fn dropAhead(self: *Dsv41Model) void {
         if (self.ahead) |a| a.finish();
@@ -603,6 +608,12 @@ pub const Dsv41Model = struct {
     /// Whether the model projects logits (a tensor split's other ranks hold no head).
     pub fn hasHead(self: *const Dsv41Model) bool {
         return self.head.w.ctx != null or self.head.ext != null;
+    }
+
+    /// The head a draft's rows go through: its 8-bit copy where the trunk's head stays dense (`draft_head`), else the
+    /// trunk's own.
+    pub fn draftHead(self: *const Dsv41Model) *const Lin {
+        return if (self.draft_head) |*h| h else &self.head;
     }
 
     fn own(self: *Dsv41Model, x: A) !A {
@@ -721,13 +732,15 @@ pub fn cedSplit(c: *const Config) ?usize {
     return split;
 }
 
-/// `MLX_SERVE_DSV41_HEAD8=0` serves a dense LM head as the pack ships it instead of requantizing it to 8-bit.
+/// This build serves a dense LM head as the pack ships it; `MLX_SERVE_DSV41_HEAD8=1` requantizes it to 8-bit (the
+/// upstream default). A server the app starts carries no shell environment, so the default is the one that changes
+/// nothing about the weights.
 pub fn head8Wanted() bool {
     return head8From(env.get(.MLX_SERVE_DSV41_HEAD8));
 }
 
 fn head8From(v: ?[*:0]const u8) bool {
-    return v == null or v.?[0] != '0';
+    return v != null and v.?[0] != '0';
 }
 
 var ced_env: ?bool = null;
@@ -884,6 +897,27 @@ fn quantizeLin(m: *Dsv41Model, w: *Weights, l: Lin, bits: u32, gs: u32) !Lin {
     try evalAll(&t);
     release(m, w, l.w);
     return .{ .w = t[0], .s = t[1], .b = t[2], .qp = .{ .bits = bits, .group_size = gs } };
+}
+
+/// `l` (dense) as affine `bits` over groups of `gs`, beside the dense weight, which stays.
+fn quantizedCopy(m: *Dsv41Model, l: Lin, bits: u32, gs: u32) !Lin {
+    var qv = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qv);
+    try mlx.check(mlx.mlx_quantize(&qv, l.w, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", none, m.s));
+    var t: [3]A = undefined;
+    for (&t, 0..) |*a, i| {
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&o, qv, i));
+        a.* = try m.own(o);
+    }
+    try evalAll(&t);
+    return .{ .w = t[0], .s = t[1], .b = t[2], .qp = .{ .bits = bits, .group_size = gs } };
+}
+
+/// `MLX_SERVE_DSV41_DRAFT_HEAD8=1` drafts through an 8-bit copy of the trunk's dense head; unset, drafts read the
+/// dense head too (nothing quantized unless asked).
+pub fn draftHead8Wanted() bool {
+    return if (env.get(.MLX_SERVE_DSV41_DRAFT_HEAD8)) |v| v[0] != '0' else false;
 }
 
 fn bankOf(l: Lin) Bank {
@@ -1813,7 +1847,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         m.head = if (tp_worker) .{ .w = none } else try getLin(m, w, cfg.hidden_size, "head", .{});
         if (m.head.ext != null) log.info("deepseek_v41: lm head on {s}, as shipped\n", .{opts.quant.?.name()}) else if (!tp_worker and m.head.s.ctx == null) {
             if (opts.head_8bit) m.head = try quantizeLin(m, w, m.head, 8, 64);
-            log.info("deepseek_v41: lm head {s}\n", .{if (opts.head_8bit) "requantized to 8-bit (MLX_SERVE_DSV41_HEAD8=0 keeps it dense)" else "dense, as shipped"});
+            log.info("deepseek_v41: lm head {s}\n", .{if (opts.head_8bit) "requantized to 8-bit (MLX_SERVE_DSV41_HEAD8=1; unset keeps it dense)" else "dense, as shipped"});
         }
         m.norm = try ownCast(m, try getW(w, "norm.weight", .{}), m.act);
     }
@@ -1847,6 +1881,10 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         m.n_mtp = n_stages;
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
         m.ds_block = cfg.dsv4_dspark_block_size;
+        if (!worker and !tp_worker and opts.tp == null and m.head.ext == null and m.head.w.ctx != null and m.head.s.ctx == null and draftHead8Wanted()) {
+            m.draft_head = try quantizedCopy(m, m.head, 8, 64);
+            log.info("deepseek_v41: DSpark drafts through an 8-bit copy of the lm head (MLX_SERVE_DSV41_DRAFT_HEAD8=1; unset: the dense head)\n", .{});
+        }
     }
     if (!worker) if (opts.pack_dir) |dir| try initEngram(m, w, dir);
     {
@@ -6908,7 +6946,7 @@ fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool
     var pre = try onehotPre(sc, m, B);
     for (0..m.n_mtp) |si| x = try stageBlock(sc, m, &.{st}, m.n_layers + si, x, &pre, B);
     const hout = try hcCollapse(sc, x, pre);
-    const logits = try sc.astype(try m.head.apply(sc, try sc.rms(hout, ds.norm, c.rms_norm_eps)), .float32);
+    const logits = try sc.astype(try m.draftHead().apply(sc, try sc.rms(hout, ds.norm, c.rms_norm_eps)), .float32);
     var cur = try sc.ints(ids[0..1], &.{1});
     const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
     // The fused chain (`markov.chain`: the op chain's bytes in B + 1 launches), null for a draft it does not take (the op
@@ -7000,7 +7038,7 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
     for (0..m.n_mtp) |si| x = try stageBlock(&sc, m, states, m.n_layers + si, x, &pre, B);
     const flat = try hcCollapse(&sc, x, pre);
     const hout = try sc.reshape(flat, &.{ ci(N), ci(B), ci(d) });
-    const logits = try sc.reshape(try sc.astype(try m.head.apply(&sc, try sc.rms(flat, ds.norm, c.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
+    const logits = try sc.reshape(try sc.astype(try m.draftHead().apply(&sc, try sc.rms(flat, ds.norm, c.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
     const firsts = try gpa.alloc(i32, N);
     defer gpa.free(firsts);
     for (firsts, t1s) |*f, t| f.* = @intCast(t);
@@ -10138,8 +10176,8 @@ test "dsv41 tensor parallel: two ranks sum a bf16 part as it is, a wider part at
     }
 }
 
-test "dsv41 head: the 8-bit head is the default, MLX_SERVE_DSV41_HEAD8=0 keeps the head as the pack ships it" {
-    try testing.expect(head8From(null));
+test "dsv41 head: the head stays as the pack ships it by default, MLX_SERVE_DSV41_HEAD8=1 requantizes it to 8-bit" {
+    try testing.expect(!head8From(null));
     try testing.expect(head8From("1"));
     try testing.expect(!head8From("0"));
 }

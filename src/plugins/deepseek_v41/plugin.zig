@@ -263,6 +263,17 @@ fn gpuOf(s: mlx.mlx_stream) ?mlx.mlx_stream {
 }
 
 /// The per-model `mtp` setting (`{"mtp": false}` keeps the DSpark stages off).
+/// The model's `lm_head_mxfp8` setting (`model-settings.json`, `--lm-head-mxfp8`): this model's dense LM head served
+/// 8-bit. Here that is the affine 8-bit head `MLX_SERVE_DSV41_HEAD8=1` makes (256 even steps a group of 64: closer
+/// to a bf16 head's values than MXFP8's three mantissa bits), the one this model's perplexity fixture scores.
+fn head8Setting(settings_json: []const u8) ?bool {
+    if (settings_json.len == 0) return null;
+    const S = struct { lm_head_mxfp8: ?bool = null };
+    const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.lm_head_mxfp8;
+}
+
 fn mtpSetting(settings_json: []const u8) ?bool {
     if (settings_json.len == 0) return null;
     const S = struct { mtp: ?bool = null };
@@ -294,7 +305,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     defer if (quant) |q| q.close();
     // A pack an outside plugin reads has no tower reader here: its weights leave before the bank sizes its rows.
     if (quant != null) m.weights.dropPrefix("vision.");
-    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant });
+    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted() or (head8Setting(ctx.settings_json.slice()) orelse false), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant });
     errdefer m.mdl.deinit();
     // The fused Markov chain's kernels compiled now, not in the first draft.
     if (m.mdl.dspark) |*w| try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
@@ -825,6 +836,15 @@ fn engramResident(dir: []const u8, settings_json: []const u8, shards: u64) !u64 
     const v = residentBytes(&.{ .private = &c }, .of(dir), .of(settings_json), shards, &out);
     if (!v.isOk()) return error.Refused;
     return out;
+}
+
+test "deepseek_v41 head8Setting: the model's lm_head_mxfp8 setting, unset when the load states none" {
+    try std.testing.expectEqual(@as(?bool, null), head8Setting(""));
+    try std.testing.expectEqual(@as(?bool, null), head8Setting("{}"));
+    try std.testing.expectEqual(@as(?bool, null), head8Setting("{\"mtp\":true}"));
+    try std.testing.expectEqual(@as(?bool, true), head8Setting("{\"lm_head_mxfp8\":true,\"mtp\":true}"));
+    try std.testing.expectEqual(@as(?bool, false), head8Setting("{\"lm_head_mxfp8\":false}"));
+    try std.testing.expectEqual(@as(?bool, null), head8Setting("not json"));
 }
 
 test "deepseek_v41 resident bill: a --mlx-gguf set (a file, not a pack dir) bills what its loader keeps" {
