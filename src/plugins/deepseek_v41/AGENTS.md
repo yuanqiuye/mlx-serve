@@ -103,6 +103,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   `Routed.decode_ids` routed ids runs the prompt phase; a 9-16 token prompt on the EXL3 bank failed `NotPrefill`.
 - Engram tables are read whole and past the page cache only beside a streamed bank (`Table.readDirect`): on a resident
   MLX pack the direct whole-grid read slowed warm prompts (the cache served their rows), and the bank needs that memory.
+- A mapped Engram table serves a row out of the map only from pages the page cache holds (`engram_direct.Map.held`:
+  the kernel's answer at the open and whenever timed copies wait on the drive, plus every page a pread has read); any
+  other row is a pread. Page faults on one file run one after another: a never-read prompt took six times as long.
 - A resident pack reads its Engram CODES past the page cache while memory is tight (`Table.openCodes`, `pastCache`,
   `engram.cacheTight`: under an eighth of RAM free, asked at each prompt chunk), its scales always through it: with
   no room the cache evicted the scales to hold codes read once and every row cost two reads; with room the cache wins.

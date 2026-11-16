@@ -847,3 +847,13 @@ Nemotron-Transcribe packs carried the same layout. Cause: the scan resolves a du
 placement dropped any quant leaf whose weight's carrier was another shard; mlx-lm shards by size, so a leaf alone in the
 next shard is its pair's only copy. Fix: a leaf is a retired copy only when its own shard also carries its weight.
 Guard: `loadWeights keeps a quant triple the shards split, with no key duplicated` (valid and stale index).
+
+### Mapped Engram tables read a never-read prompt by page faults
+Defect: a 133k-token prompt whose Engram rows were not in the page cache took 305 s (DeepSeek-V4.1, a pack just
+loaded, or one whose 203 GB of FP8 tables the cache cannot hold whole) where preads took 32 s; a 1.4k-token prompt
+4.0 s for 0.6 s. Cause: every row was copied out of the map, and a row on a page the page cache does not hold is
+read by a page fault; faults on one file run one after another (28-56k rows a second on 32 threads, preads 190-310k).
+Fix: `engram_direct.Map` copies a row out of the map only from pages it takes as held (mincore at the open and again
+when timed copies wait on the drive, pages marked as preads read them) and reads every other row by pread.
+Guard: `engram_direct map: a row is a pread until the page cache is known to hold its pages`.
+
