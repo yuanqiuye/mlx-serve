@@ -526,8 +526,8 @@ pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const 
         {
             const ev = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(ev);
-            _ = mlx.mlx_vector_array_append_value(ev, bg.accept_p);
-            _ = mlx.mlx_vector_array_append_value(ev, bg.corr_samples);
+            var buf: [4]mlx.mlx_array = undefined;
+            for (bg.readouts(&buf)) |a| _ = mlx.mlx_vector_array_append_value(ev, a);
             try mlx.check(mlx.mlx_async_eval(ev));
         }
         try mlx.check(mlx.mlx_array_eval(bg.accept_p));

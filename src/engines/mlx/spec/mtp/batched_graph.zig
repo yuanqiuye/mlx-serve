@@ -33,6 +33,18 @@ pub const MtpBatchedGraph = struct {
     /// [m] bool TokenV3 deferral decisions; null for other modes.
     accept_defer: mlx.mlx_array = .{ .ctx = null },
 
+    /// Every array the verdict reads, to evaluate together: one hand-over to the GPU and one wait for the round's
+    /// rule (an array left out is a second wait, with the GPU idle between).
+    pub fn readouts(self: *const MtpBatchedGraph, buf: *[4]mlx.mlx_array) []const mlx.mlx_array {
+        var n: usize = 0;
+        for ([_]mlx.mlx_array{ self.accept_p, self.accept_q, self.accept_defer, self.corr_samples }) |a| {
+            if (a.ctx == null) continue;
+            buf[n] = a;
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
     pub fn deinit(self: *MtpBatchedGraph) void {
         _ = mlx.mlx_array_free(self.corr_samples);
         _ = mlx.mlx_array_free(self.accept_p);
@@ -508,6 +520,39 @@ test "batched corrections read only 1+m rows of a group-padded verify block" {
     try testing.expectEqual(@as(i32, 1), corr[0]);
     try testing.expectEqual(@as(i32, 1), corr[1]);
     try testing.expectEqual(@as(i32, 3), corr[2]);
+}
+
+test "a batched verdict's readouts are every array its rule reads: one evaluation, one wait" {
+    const s = mlx.gpuStream();
+    const p_data = [_]f32{ 0.5, 0.5, 0, 0, 0, 0, 0, 1 };
+    const p_shape = [_]c_int{ 1, 2, 4 };
+    const probs = mlx.mlx_array_new_data(&p_data, &p_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const id: i32 = 0;
+    const id_shape = [_]c_int{1};
+    const draft = mlx.mlx_array_new_data(&id, &id_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(draft);
+    const drafts = [_]mlx.mlx_array{draft};
+    var buf: [4]mlx.mlx_array = undefined;
+    // Exact, greedy proposals: the accept vector and the corrections.
+    var exact = try Generator.mtpBatchedAcceptGraph(probs, &drafts, null, 1, .{}, s);
+    defer exact.deinit();
+    try testing.expectEqual(@as(usize, 2), exact.readouts(&buf).len);
+    // Typical: its entropy floor too, or the verdict would wait on the GPU a second time for it.
+    var typical = try Generator.mtpBatchedTypicalGraph(probs, &drafts, null, 1, 0.2, .{}, s);
+    defer typical.deinit();
+    const t = typical.readouts(&buf);
+    try testing.expectEqual(@as(usize, 3), t.len);
+    var floor_in = false;
+    for (t) |a| floor_in = floor_in or a.ctx == typical.accept_q.ctx;
+    try testing.expect(floor_in);
+    // TokenV3: its deferrals too.
+    var v3 = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, null, 1, 0.95, .{}, s);
+    defer v3.deinit();
+    const v = v3.readouts(&buf);
+    var defer_in = false;
+    for (v) |a| defer_in = defer_in or a.ctx == v3.accept_defer.ctx;
+    try testing.expect(defer_in and v3.accept_defer.ctx != null);
 }
 
 test "MTP typical batched graph uses entropy floor and target-row correction" {
