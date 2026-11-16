@@ -138,10 +138,15 @@ pub const VerifyCost = struct {
     const SEED: u32 = 3;
     /// Samples before a row count's own time prices it.
     const TRUST: u32 = 2;
+    /// Rounds a row count's time is trusted for after its last sample.
+    pub const FRESH: u32 = 256;
 
-    /// Verify ms by rows (index = rows, 0 unused), each over `seen` samples.
+    /// Verify ms by rows (index = rows, 0 unused), each over `seen` samples, the last of them at round `at`.
     ms: [MAX_ROWS + 1]f32 = @splat(0),
     seen: [MAX_ROWS + 1]u32 = @splat(0),
+    at: [MAX_ROWS + 1]u32 = @splat(0),
+    /// Verifies sampled so far.
+    round: u32 = 0,
     /// A draft's forward, the cost a drafted round pays whatever it verifies.
     draft_ms: f32 = 0,
     draft_seen: u32 = 0,
@@ -157,6 +162,10 @@ pub const VerifyCost = struct {
     /// A verify of `rows` rows (t1 included) took `took` ms.
     pub fn sample(self: *VerifyCost, rows: usize, took: f32) void {
         if (rows == 0 or rows > MAX_ROWS) return;
+        self.round +%= 1;
+        // A stale row count starts over: what it read before the rounds left it may have been a stall.
+        if (!self.fresh(rows)) self.seen[rows] = 0;
+        self.at[rows] = self.round;
         learn(&self.ms[rows], &self.seen[rows], took);
     }
 
@@ -170,34 +179,71 @@ pub const VerifyCost = struct {
         return if (self.draft_seen >= TRUST) self.draft_ms else 0;
     }
 
-    fn known(self: *const VerifyCost, r: usize) bool {
-        return self.seen[r] >= TRUST;
+    fn fresh(self: *const VerifyCost, r: usize) bool {
+        return self.round -% self.at[r] <= FRESH;
     }
 
-    /// The verify's ms by rows: a measured row count its own time; one between two measured ones on their line; one
-    /// past the last measured one that row's time plus the prior ladder's steps (scaled to `plain_ms`); never cheaper
-    /// for more rows. With nothing measured this is `priorCosts(plain_ms)`.
+    /// A row count the rounds stopped choosing is never sampled again, so a stall it once read would price it for
+    /// good: past `FRESH` rounds it is priced from the row counts still measured.
+    fn known(self: *const VerifyCost, r: usize) bool {
+        return self.seen[r] >= TRUST and self.fresh(r);
+    }
+
+    /// The verify's ms by rows: a measured row count its own time, capped by every wider measured one (a stall only
+    /// reads slower: of two that disagree the narrower is the stale one); one between two measured ones on their
+    /// line; one below the first on the line of the first two (with one measured: the prior, no dearer than it); one
+    /// past the last that row's time plus the prior ladder's steps (scaled to `plain_ms`); never cheaper for more
+    /// rows. With nothing measured this is `priorCosts(plain_ms)`.
     pub fn costs(self: *const VerifyCost, plain_ms: f32) Costs {
         const prior = priorCosts(plain_ms);
         var out = prior;
+        var ms: Costs = undefined;
+        var cap = std.math.inf(f32);
+        var first: usize = 0;
+        var second: usize = 0;
+        var r: usize = MAX_ROWS;
+        while (r >= 1) : (r -= 1) {
+            if (!self.known(r)) continue;
+            cap = @min(cap, self.ms[r]);
+            ms[r] = cap;
+            second = first;
+            first = r;
+        }
         var last: usize = 0; // the last measured row count at or below r
-        for (1..MAX_ROWS + 1) |r| {
-            if (self.known(r)) {
-                out[r] = self.ms[r];
-                last = r;
+        for (1..MAX_ROWS + 1) |q| {
+            if (self.known(q)) {
+                out[q] = ms[q];
+                last = q;
                 continue;
             }
-            if (last == 0) continue; // below the first measured row: the prior
-            const next: usize = for (r + 1..MAX_ROWS + 1) |q| {
-                if (self.known(q)) break q;
+            if (last == 0) {
+                if (first == 0) continue; // nothing measured: the prior
+                if (second == 0) {
+                    out[q] = @min(prior[q], ms[first]);
+                    continue;
+                }
+                const step = (ms[second] - ms[first]) / @as(f32, @floatFromInt(second - first));
+                // No cheaper than the prior ladder makes a narrower verify of the first measured one.
+                out[q] = @max(ms[first] - step * @as(f32, @floatFromInt(first - q)), ms[first] * prior[q] / prior[first]);
+                continue;
+            }
+            const next: usize = for (q + 1..MAX_ROWS + 1) |n| {
+                if (self.known(n)) break n;
             } else 0;
             if (next != 0) {
-                const t = @as(f32, @floatFromInt(r - last)) / @as(f32, @floatFromInt(next - last));
-                out[r] = self.ms[last] + (self.ms[next] - self.ms[last]) * t;
-            } else out[r] = out[r - 1] + (prior[r] - prior[r - 1]);
+                const t = @as(f32, @floatFromInt(q - last)) / @as(f32, @floatFromInt(next - last));
+                out[q] = ms[last] + (ms[next] - ms[last]) * t;
+            } else out[q] = out[q - 1] + (prior[q] - prior[q - 1]);
         }
-        for (2..MAX_ROWS + 1) |r| out[r] = @max(out[r], out[r - 1]);
+        for (2..MAX_ROWS + 1) |q| out[q] = @max(out[q], out[q - 1]);
         return out;
+    }
+
+    /// What the ladder prices one row at, when it measured that row or at least two others; else null.
+    pub fn oneRow(self: *const VerifyCost, plain_ms: f32) ?f32 {
+        var n: u32 = 0;
+        for (1..MAX_ROWS + 1) |r| n += @intFromBool(self.known(r));
+        return if (self.known(1) or n >= 2) self.costs(plain_ms)[1] else null;
     }
 
     /// `1:17.6,2:21.4,...`: the measured row counts, for `[spec-stats]`.
@@ -287,6 +333,13 @@ pub const PlainCost = struct {
     fn seed(self: *PlainCost, ms: f32) void {
         self.ms = if (self.measured == 0) ms else @min(self.ms, ms);
         self.measured += 1;
+    }
+
+    /// A plain step is a verify of one row: no dearer than a verify ladder prices that row (`VerifyCost.oneRow`).
+    /// Rounds that always draft never sample the plain step, so a stall it once read would stay.
+    pub fn cap(self: *PlainCost, one_row_ms: ?f32) void {
+        const ms = one_row_ms orelse return;
+        if (std.math.isFinite(ms) and ms > 0) self.ms = @min(self.ms, ms);
     }
 };
 
@@ -646,6 +699,72 @@ test "VerifyCost: the prior until rows are measured, then each row count's own t
     try approx(v.draftMs(), 4);
     var buf: [128]u8 = undefined;
     try testing.expect(std.mem.startsWith(u8, v.format(&buf), "1:17.5,2:"));
+}
+
+test "VerifyCost: a row count the rounds have left is priced by the ones they still measure" {
+    var v: VerifyCost = .{};
+    const true_ms = struct {
+        fn of(r: usize) f32 {
+            return 17 + 4 * @as(f32, @floatFromInt(r - 1));
+        }
+    }.of;
+    for (1..7) |r| for (0..3) |_| v.sample(r, true_ms(r));
+    // A stall while 1, 3 and 5 rows are in use: they read 40% slow, and the rounds then leave them for 2, 4 and 6.
+    for (0..40) |_| for ([_]usize{ 1, 3, 5 }) |r| v.sample(r, 1.4 * true_ms(r));
+    var c = v.costs(17);
+    // At once: a narrower verify is never priced above a wider measured one, and the wider one keeps its own time.
+    try approx(c[2], 21);
+    try approx(c[4], 29);
+    try approx(c[6], 37);
+    try testing.expect(c[1] <= c[2] and c[3] <= c[4] and c[5] <= c[6]);
+    // Left unsampled, the three go stale: priced on the line through the rows still measured.
+    for (0..VerifyCost.FRESH + 1) |i| v.sample(2 + 2 * (i % 3), true_ms(2 + 2 * (i % 3)));
+    c = v.costs(17);
+    try approx(c[1], 17);
+    try approx(c[3], 25);
+    try approx(c[5], 33);
+    try approx(v.oneRow(40).?, 17);
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("2:21.0,4:29.0,6:37.0", v.format(&buf));
+    // Sampled again, a stale count starts over from the fastest of its new samples.
+    v.sample(3, 60);
+    try approx(v.costs(17)[3], 25);
+    v.sample(3, 25.5);
+    v.sample(3, 26);
+    try approx(v.costs(17)[3], 25.5);
+}
+
+test "VerifyCost: one measured row count prices the narrower ones no dearer than itself, and says nothing of one row" {
+    var v: VerifyCost = .{};
+    try testing.expect(v.oneRow(17.5) == null);
+    for (0..3) |_| v.sample(2, 21);
+    // The plain step's own estimate is stale and high: it must not price one row above the two measured.
+    const c = v.costs(30);
+    try approx(c[1], 21);
+    try approx(c[2], 21);
+    try testing.expect(v.oneRow(30) == null);
+    for (0..3) |_| v.sample(4, 29);
+    try approx(v.oneRow(30).?, 17);
+    for (0..3) |_| v.sample(1, 17.4);
+    try approx(v.oneRow(30).?, 17.4);
+}
+
+test "PlainCost: no dearer than the ladder prices one row, once the ladder can say" {
+    var plain: PlainCost = .{ .ms = 26.4 };
+    var v: VerifyCost = .{};
+    plain.cap(v.oneRow(plain.ms));
+    try approx(plain.ms, 26.4);
+    for (0..3) |_| v.sample(2, 21);
+    for (0..3) |_| v.sample(4, 29);
+    plain.cap(v.oneRow(plain.ms));
+    try approx(plain.ms, 17);
+    // A cheaper plain step keeps its own time.
+    plain.ms = 16.5;
+    plain.cap(v.oneRow(plain.ms));
+    try approx(plain.ms, 16.5);
+    plain.cap(std.math.nan(f32));
+    plain.cap(-1);
+    try approx(plain.ms, 16.5);
 }
 
 test "VerifyCost: this model's ladder verifies a draft the prior ladder leaves" {

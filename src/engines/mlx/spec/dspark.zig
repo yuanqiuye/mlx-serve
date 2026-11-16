@@ -311,6 +311,8 @@ fn sampleVerifyMs(self: *Generator, rows: usize, ms: f32) void {
     const pol = &self.dspark_pol.?;
     pol.ladder.sample(rows, ms);
     self.xfm.dspark_ladder = pol.ladder;
+    pol.plain.cap(pol.ladder.oneRow(pol.plain.ms));
+    self.xfm.dspark_plain = pol.plain;
 }
 
 var learned_ladder: ?bool = null;
