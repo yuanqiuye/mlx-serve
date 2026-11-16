@@ -35,111 +35,230 @@ const State = struct {
 };
 
 /// A mapped table file. A row is copied out of the map only from pages the page cache holds: a page it does not hold
-/// is read by a page fault, and faults on one file run one after another (a never-read prompt's rows took six times a
-/// pread's time). `held` is the kernel's answer when it was last asked (`refresh`), plus every page a pread has read
-/// since.
+/// is read by a page fault, and faults that read the drive run one after another on one file (35,000 a second on an
+/// M5 Ultra whatever the threads; a pread of such a page, 170,000). `held` is the kernel's answer when it was last
+/// asked (`refresh`), plus every page a pread has read since, plus the pages a row was copied out of (`touched`: in
+/// this process's address space, the pages the kernel drops last, and about 95% of a prompt's row reads). The kernel
+/// drops pages without a word: copies that page in from the drive say `held` has gone stale (`Ctl.pagedIn`), and
+/// until the kernel has answered again only the touched pages' rows are copies, the others preads (`Trust`).
 const Map = struct {
     fd: c_int = -1,
     base: [*]const u8 = undefined,
     len: usize = 0,
-    /// A byte a page, as `mincore` fills it: bit 0 set while the page cache is taken to hold the page.
+    /// A byte a page: `in_cache` while the page cache is taken to hold the page, `touched` once a row was copied out
+    /// of it since.
     held: []u8 = &.{},
+    /// Where the kernel's answer lands before it is merged into `held` (`ask`); the refresh in flight owns it.
+    answer: []u8 = &.{},
     /// log2 of the page size.
     shift: u6 = 14,
     ctl: ?*Ctl = null,
 
-    fn holds(m: *const Map, off: u64, n: usize) bool {
+    const in_cache: u8 = 1;
+    const touched: u8 = 2;
+
+    /// The bits both of the bytes' pages have (a row lies on two at most).
+    fn bits(m: *const Map, off: u64, n: usize) u8 {
         const a: usize = @intCast(off >> m.shift);
         const b: usize = @intCast((off + n - 1) >> m.shift);
-        return @atomicLoad(u8, &m.held[a], .monotonic) & @atomicLoad(u8, &m.held[b], .monotonic) & 1 != 0;
+        return @atomicLoad(u8, &m.held[a], .monotonic) & @atomicLoad(u8, &m.held[b], .monotonic);
     }
 
+    fn holds(m: *const Map, off: u64, n: usize) bool {
+        return m.bits(off, n) & in_cache != 0;
+    }
+
+    /// `want` set on the bytes' pages; a page that has it is not written.
+    fn set(m: *const Map, off: u64, n: usize, want: u8) void {
+        for ([2]usize{ @intCast(off >> m.shift), @intCast((off + n - 1) >> m.shift) }) |i| {
+            const have = @atomicLoad(u8, &m.held[i], .monotonic);
+            if (have & want != want) @atomicStore(u8, &m.held[i], have | want, .monotonic);
+        }
+    }
+
+    /// A pread read the bytes: the page cache holds their pages (a touched page stays touched).
     fn mark(m: *const Map, off: u64, n: usize) void {
-        @atomicStore(u8, &m.held[@intCast(off >> m.shift)], 1, .monotonic);
-        @atomicStore(u8, &m.held[@intCast((off + n - 1) >> m.shift)], 1, .monotonic);
+        m.set(off, n, in_cache);
     }
 
-    /// `dst` out of the map. One copy in eight is timed: the kernel drops pages without a word, and a copy that
-    /// waited on the drive says `held` has gone stale.
+    /// Whether the bytes are copied out of the map: their pages taken as held, as far as `held` is trusted.
+    fn copies(m: *const Map, off: u64, n: usize) bool {
+        const need: u8 = switch (m.ctl.?.trust.load(.monotonic)) {
+            .held => in_cache,
+            .touched => touched,
+            .none => return false,
+        };
+        return m.bits(off, n) & need != 0;
+    }
+
+    /// `dst` out of the map, its pages touched from here on; every `Ctl.stride` copies the task's page-ins are
+    /// counted, and an old answer asked anew behind the copies (a load, another program: the page cache moves while
+    /// nothing here reads).
     fn copy(m: *const Map, dst: []u8, off: u64) void {
-        const src = m.base[@intCast(off)..][0..dst.len];
-        if ((off >> 8) & 7 != 0) return @memcpy(dst, src);
-        const t0 = nowNs();
-        @memcpy(dst, src);
-        if (m.ctl.?.note(nowNs() - t0 > Ctl.slow_ns)) m.distrust();
+        @memcpy(dst, m.base[@intCast(off)..][0..dst.len]);
+        m.set(off, dst.len, in_cache | touched);
+        const ctl = m.ctl.?;
+        if (!ctl.strideEnds()) return;
+        const ins = ctl.pagedIn(pageIns());
+        if (ins >= Ctl.stale_at) return m.doubt(ins);
+        if (nowNs() -% ctl.asked_ns.load(.monotonic) > Ctl.refresh_ns) refresh(m);
     }
 
-    /// `held` no longer says what the page cache holds: nothing is taken as held (every row a pread, which marks its
-    /// pages again) until the kernel has been asked anew, at once unless it was asked a moment ago (a table the
-    /// page cache cannot hold whole goes stale as fast as it is read; `Ctl.miss` asks again).
-    fn distrust(m: *const Map) void {
-        for (m.held) |*h| @atomicStore(u8, h, 0, .monotonic);
-        if (nowNs() -% m.ctl.?.asked_ns.load(.monotonic) > Ctl.distrust_gap_ns) refresh(m);
+    /// `held` is stale, `ins` page-ins in a stretch of copies: until the kernel has answered again a row is copied out
+    /// of the map only from touched pages, and from none once `Ctl.thrash_at` page-ins fall in a stretch of those (the
+    /// answer replaces what `held` takes as held; nothing is cleared here, so an answer in flight is not lost). The
+    /// kernel is asked at once unless it was asked a moment ago (a table the page cache cannot hold whole goes stale
+    /// as fast as it is read; `Ctl.miss` asks then).
+    fn doubt(m: *const Map, ins: u32) void {
+        const ctl = m.ctl.?;
+        switch (ctl.trust.load(.monotonic)) {
+            .held => ctl.trust.store(.touched, .monotonic),
+            .touched => if (ins >= Ctl.thrash_at) ctl.trust.store(.none, .monotonic),
+            .none => {},
+        }
+        _ = ctl.doubts.fetchAdd(1, .monotonic);
+        if (nowNs() -% ctl.asked_ns.load(.monotonic) > Ctl.doubt_gap_ns) refresh(m);
     }
 };
 
+/// How far a map's `held` is trusted: wholly; for touched pages only (copies paged in from the drive: some page it
+/// takes as held is not); for none (touched pages' copies paged in as well).
+const Trust = enum(u8) { held, touched, none };
+
 /// A map's counters, at an address of their own: a refresh in flight holds it.
 const Ctl = struct {
-    /// A copy longer than this waited on the drive: a copy from a held page takes under 10 us, a page fault that
-    /// reads the drive 80 us and up.
-    const slow_ns: u64 = 50_000;
-    /// Timed copies a verdict is taken over, and the slow ones among them that make `held` stale. A thread that lost
-    /// its core mid-copy reads slow too, a few in a window.
-    const window: u32 = 2048;
-    const stale_at: u32 = 32;
+    /// Copies between two looks at the task's page-in count, and the page-ins in one such stretch that make `held`
+    /// stale. A page-in is a page read from the drive by a fault, the task's own count of them: a copy from a page the
+    /// page cache holds adds none however long it takes (a first touch waits on the address space, not the drive), so
+    /// nothing here is timed. About one copy in twenty is a page's first, and a first copy that reads the drive costs
+    /// five preads' time: three in a stretch is where preads for the untouched pages break even. Suspicion costs
+    /// little (touched pages' rows stay copies, the answer takes a third of a second), other files' page-ins count
+    /// too: a handful.
+    const stride: u32 = 1024;
+    const stale_at: u32 = 8;
+    /// The page-ins in a stretch of copies out of touched pages alone that say those are being dropped too (a table
+    /// the page cache cannot hold). Past one copy in seventeen a pread a row is faster; the count sits above that and
+    /// above the copies in flight when the suspicion began (32 threads a table), which page in after it.
+    const thrash_at: u32 = 128;
     /// Preads between two looks at the clock, and how old an answer may get while rows are still read by pread.
     const miss_stride: u32 = 4096;
     const refresh_ns: u64 = 10 * std.time.ns_per_s;
     /// The least time between two questions that stale copies ask for.
-    const distrust_gap_ns: u64 = 3 * std.time.ns_per_s;
+    const doubt_gap_ns: u64 = 3 * std.time.ns_per_s;
 
-    timed: std.atomic.Value(u32) = .init(0),
-    slow: std.atomic.Value(u32) = .init(0),
-    misses: std.atomic.Value(u32) = .init(0),
+    copied_n: std.atomic.Value(u64) = .init(0),
+    /// The task's page-ins when a stretch of copies last ended.
+    page_ins: std.atomic.Value(u32) = .init(0),
+    misses: std.atomic.Value(u64) = .init(0),
+    /// The questions put to the kernel, and the times copies found `held` stale.
+    asks: std.atomic.Value(u32) = .init(0),
+    doubts: std.atomic.Value(u32) = .init(0),
     refreshing: std.atomic.Value(bool) = .init(false),
+    /// How far `held` is trusted until the kernel's next answer.
+    trust: std.atomic.Value(Trust) = .init(.held),
     /// When the kernel was last asked (ns of the uptime clock).
     asked_ns: std.atomic.Value(u64) = .init(0),
 
-    /// A timed copy; true when the window it closes holds `stale_at` slow copies.
-    fn note(c: *Ctl, slow: bool) bool {
-        if (slow) _ = c.slow.fetchAdd(1, .monotonic);
-        if (c.timed.fetchAdd(1, .monotonic) + 1 < window) return false;
-        c.timed.store(0, .monotonic);
-        return c.slow.swap(0, .monotonic) >= stale_at;
+    /// A copy; true when it ends a stretch of `stride`.
+    fn strideEnds(c: *Ctl) bool {
+        return (c.copied_n.fetchAdd(1, .monotonic) + 1) % stride == 0;
     }
 
-    /// A pread of a page not taken as held; true when it is time to ask the kernel again.
+    /// The end of a stretch of copies, the task's page-ins now `now`: how many fell in the stretch (other files'
+    /// page-ins count too: a refresh they cost is one question to the kernel).
+    fn pagedIn(c: *Ctl, now: u32) u32 {
+        return now -% c.page_ins.swap(now, .monotonic);
+    }
+
+    /// A pread of a page not taken as held; true when it is time to ask the kernel again: `held` under suspicion and
+    /// the last question `doubt_gap_ns` old, or any answer `refresh_ns` old.
     fn miss(c: *Ctl) bool {
         if (c.misses.fetchAdd(1, .monotonic) % miss_stride != 0) return false;
-        return nowNs() -% c.asked_ns.load(.monotonic) > refresh_ns;
+        const age = nowNs() -% c.asked_ns.load(.monotonic);
+        return age > refresh_ns or (c.trust.load(.monotonic) != .held and age > doubt_gap_ns);
     }
 };
 
 extern "c" fn clock_gettime_nsec_np(clock_id: c_int) u64;
 extern "c" fn mincore(addr: *const anyopaque, len: usize, vec: [*]u8) c_int;
 extern "c" fn usleep(usec: c_uint) c_int;
+extern "c" fn task_info(task: u32, flavor: u32, info: *anyopaque, count: *u32) c_int;
+extern "c" var mach_task_self_: u32;
+
+/// The task's page-ins so far (`TASK_EVENTS_INFO`), 0 where it cannot be read.
+fn pageIns() u32 {
+    if (comptime !builtin.os.tag.isDarwin()) return 0;
+    var events: [8]i32 = undefined;
+    var n: u32 = events.len;
+    if (task_info(mach_task_self_, 2, &events, &n) != 0 or n < 2) return 0;
+    return @bitCast(events[1]);
+}
 
 /// The uptime clock in ns (a file is mapped on Darwin only).
 fn nowNs() u64 {
     return if (comptime builtin.os.tag.isDarwin()) clock_gettime_nsec_np(8) else 0;
 }
 
-/// The kernel asked which of `m`'s pages the page cache holds, on a thread of its own (a second or two a 100 GB
-/// table); a request while one is in flight is dropped.
+/// Threads the kernel is asked on, each a run of the file's pages (a 74 GB table's 4.5M pages: 1.5 s on one, 0.35 s
+/// on eight, 0.25 s on sixteen; rows are copied beside it at their own speed), and the fewest pages a thread is worth.
+const ask_threads = 8;
+const ask_pages: usize = if (builtin.is_test) 1 else 1 << 16;
+
+/// The kernel asked which of `m`'s pages the page cache holds, on threads of its own; a request while one is in
+/// flight is dropped.
 fn refresh(m: *const Map) void {
     const ctl = m.ctl.?;
     if (ctl.refreshing.swap(true, .acq_rel)) return;
     ctl.asked_ns.store(nowNs(), .monotonic);
-    const th = std.Thread.spawn(.{}, ask, .{ m.base, m.len, m.held, ctl }) catch {
+    _ = ctl.asks.fetchAdd(1, .monotonic);
+    const th = std.Thread.spawn(.{}, ask, .{ m.*, ctl }) catch {
         ctl.refreshing.store(false, .release);
         return;
     };
     th.detach();
 }
 
-fn ask(base: [*]const u8, len: usize, held: []u8, ctl: *Ctl) void {
-    // A failed call leaves `held` as it was: zeros are preads, and a stale byte is found by the timed copies.
-    if (comptime builtin.os.tag.isDarwin()) _ = mincore(base, len, held.ptr);
+/// The kernel's answer for a page (`mincore`'s byte: bit 0 is the page cache holding it, the other bits are not this
+/// file's `touched`) merged into what `held` had: held or not as the kernel says, touched only while held.
+fn merged(have: u8, got: u8) u8 {
+    return if (got & 1 != 0) Map.in_cache | (have & Map.touched) else 0;
+}
+
+fn ask(m: Map, ctl: *Ctl) void {
+    const Scan = struct {
+        m: Map,
+        parts: usize,
+        ok: std.atomic.Value(bool) = .init(true),
+        fn part(s: *@This(), k: usize) void {
+            const pages = s.m.held.len;
+            const lo = pages * k / s.parts;
+            const hi = pages * (k + 1) / s.parts;
+            if (hi == lo) return;
+            const at = lo << s.m.shift;
+            const n = @min(s.m.len, hi << s.m.shift) - at;
+            if (comptime builtin.os.tag.isDarwin()) {
+                if (mincore(s.m.base + at, n, s.m.answer.ptr + lo) != 0) s.ok.store(false, .release);
+            }
+        }
+    };
+    var scan: Scan = .{ .m = m, .parts = std.math.clamp(m.held.len / ask_pages, 1, ask_threads) };
+    var threads: [ask_threads]?std.Thread = @splat(null);
+    for (threads[1..scan.parts], 1..) |*t, k| t.* = std.Thread.spawn(.{}, Scan.part, .{ &scan, k }) catch null;
+    scan.part(0);
+    for (threads[1..scan.parts], 1..) |t, k| {
+        if (t) |th| th.join() else scan.part(k);
+    }
+    // A failed call leaves `held` as it was: zeros are preads, and a stale byte is found by the copies' page-ins.
+    if (scan.ok.load(.acquire)) {
+        for (m.held, m.answer) |*h, got| {
+            const have = @atomicLoad(u8, h, .monotonic);
+            const now = merged(have, got);
+            if (now != have) @atomicStore(u8, h, now, .monotonic);
+        }
+    }
+    // The answer is fresh: page-ins before it are not its copies'.
+    ctl.page_ins.store(pageIns(), .monotonic);
+    ctl.trust.store(.held, .monotonic);
     ctl.refreshing.store(false, .release);
 }
 
@@ -183,18 +302,25 @@ pub fn map(fd: c_int) void {
     const size = std.c.lseek(fd, 0, std.c.SEEK.END);
     if (size <= 0) return;
     const page = std.heap.pageSize();
-    const held = std.heap.page_allocator.alloc(u8, (@as(usize, @intCast(size)) + page - 1) / page) catch return;
+    const pages = (@as(usize, @intCast(size)) + page - 1) / page;
+    const held = std.heap.page_allocator.alloc(u8, pages) catch return;
     @memset(held, 0);
-    const ctl = std.heap.page_allocator.create(Ctl) catch return std.heap.page_allocator.free(held);
+    const answer = std.heap.page_allocator.alloc(u8, pages) catch return std.heap.page_allocator.free(held);
+    @memset(answer, 0);
+    const ctl = std.heap.page_allocator.create(Ctl) catch {
+        std.heap.page_allocator.free(answer);
+        return std.heap.page_allocator.free(held);
+    };
     ctl.* = .{};
     const m = std.posix.mmap(null, @intCast(size), .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0) catch {
         std.heap.page_allocator.destroy(ctl);
+        std.heap.page_allocator.free(answer);
         return std.heap.page_allocator.free(held);
     };
     // Rows are read one here, one there: no read-ahead around a fault.
     _ = std.c.madvise(@ptrCast(m.ptr), m.len, std.c.MADV.RANDOM);
     const slot = &ps().maps[ps().n_maps];
-    slot.* = .{ .fd = fd, .base = m.ptr, .len = m.len, .held = held, .shift = @intCast(std.math.log2_int(usize, page)), .ctl = ctl };
+    slot.* = .{ .fd = fd, .base = m.ptr, .len = m.len, .held = held, .answer = answer, .shift = @intCast(std.math.log2_int(usize, page)), .ctl = ctl };
     ps().n_maps += 1;
     refresh(slot);
 }
@@ -206,10 +332,11 @@ pub fn unmap(fd: c_int) void {
     while (i < ps().n_maps) {
         if (ps().maps[i].fd == fd) {
             const m = ps().maps[i];
-            // A refresh in flight writes `held` and reads the map's pages' state: it ends first.
+            // A refresh in flight writes `held` and `answer` and reads the map's pages' state: it ends first.
             waitRefresh(m.ctl.?);
             std.posix.munmap(@alignCast(@constCast(m.base[0..m.len])));
             std.heap.page_allocator.free(m.held);
+            std.heap.page_allocator.free(m.answer);
             std.heap.page_allocator.destroy(m.ctl.?);
             ps().maps[i] = ps().maps[ps().n_maps - 1];
             ps().n_maps -= 1;
@@ -225,6 +352,27 @@ fn mapOf(fd: c_int) ?*const Map {
 /// Whether `fd` is mapped: its rows the page cache holds are copies out of the map.
 pub fn mapped(fd: c_int) bool {
     return mapOf(fd) != null;
+}
+
+/// A mapped file's rows since it was mapped: copies out of the map, preads, the questions put to the kernel and the
+/// times copies found the held pages stale. Zeros for a file not mapped.
+pub const Counts = struct {
+    copies: u64 = 0,
+    preads: u64 = 0,
+    asked: u32 = 0,
+    stale: u32 = 0,
+
+    pub fn add(c: *Counts, o: Counts) void {
+        c.copies += o.copies;
+        c.preads += o.preads;
+        c.asked += o.asked;
+        c.stale += o.stale;
+    }
+};
+pub fn counts(fd: c_int) Counts {
+    const m = mapOf(fd) orelse return .{};
+    const ctl = m.ctl.?;
+    return .{ .copies = ctl.copied_n.load(.monotonic), .preads = ctl.misses.load(.monotonic), .asked = ctl.asks.load(.monotonic), .stale = ctl.doubts.load(.monotonic) };
 }
 
 /// Test seams. `settle`: the refresh in flight has ended. `forget`: no page of `fd` is taken as held. `holds`:
@@ -266,7 +414,7 @@ pub fn readRow(fd: c_int, dst: []u8, off: u64) bool {
     if (comptime builtin.os.tag.isDarwin()) if (mapOf(fd)) |m| {
         if (off > m.len or dst.len > m.len - off) return false;
         if (dst.len == 0) return true;
-        if (m.holds(off, dst.len)) {
+        if (m.copies(off, dst.len)) {
             m.copy(dst, off);
             return true;
         }
@@ -409,13 +557,90 @@ test "engram_direct map: a row is a pread until the page cache is known to hold 
     try std.testing.expect(!readRow(f.fd, &row, data.len - 100));
 }
 
-test "engram_direct map: copies that waited on the drive make the held pages stale; a few slow ones do not" {
+test "engram_direct map: a stretch of copies ends every stride and counts its own page-ins" {
     var c: Ctl = .{};
-    var stale = false;
-    for (0..Ctl.window) |i| stale = c.note(i % 400 == 0) or stale;
-    try std.testing.expect(!stale);
-    for (0..Ctl.window) |i| stale = c.note(i % 50 == 0) or stale;
-    try std.testing.expect(stale);
-    // The verdict cleared the window.
-    try std.testing.expectEqual(@as(u32, 0), c.slow.load(.monotonic));
+    c.page_ins.store(1000, .monotonic);
+    // A stretch ends every `stride` copies.
+    var ends: u32 = 0;
+    for (0..3 * Ctl.stride) |_| ends += @intFromBool(c.strideEnds());
+    try std.testing.expectEqual(@as(u32, 3), ends);
+    // The page-ins of a stretch are its own: the count restarts at each end, across the counter's wrap too.
+    try std.testing.expectEqual(@as(u32, 5), c.pagedIn(1005));
+    try std.testing.expectEqual(@as(u32, 3), c.pagedIn(1008));
+    c.page_ins.store(std.math.maxInt(u32) - 3, .monotonic);
+    try std.testing.expectEqual(@as(u32, 14), c.pagedIn(10));
+}
+
+test "engram_direct map: under suspicion a row is copied only out of pages copied from before, and nothing known is thrown away" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const page = std.heap.pageSize();
+    const data = try a.alloc(u8, 3 * page);
+    defer a.free(data);
+    for (data, 0..) |*x, i| x.* = @truncate(i *% 13 +% (i >> 7));
+    const f = try testFile(a, "doubt", data);
+    defer a.free(f.path);
+    defer _ = std.c.unlink(f.path);
+    defer _ = std.c.close(f.fd);
+    map(f.fd);
+    defer unmap(f.fd);
+    // The kernel's answer, asked over more than one thread here (`ask_pages`), covers every page.
+    settle(f.fd);
+    try std.testing.expect(holds(f.fd, 0, data.len));
+    const m = mapOf(f.fd).?;
+    // A copy touches its row's page and no other.
+    var row: [256]u8 = undefined;
+    try std.testing.expect(m.copies(10, 256));
+    try std.testing.expect(readRow(f.fd, &row, 10));
+    try std.testing.expectEqualSlices(u8, data[10..][0..256], &row);
+    try std.testing.expect(m.bits(10, 256) & Map.touched != 0);
+    try std.testing.expect(m.bits(page + 10, 256) & Map.touched == 0);
+    // The page-ins say `held` is stale, the kernel was asked a moment ago: suspicion stays until a pread's turn to
+    // ask (`Ctl.miss`). The touched page's rows are still copies; an untouched page's row, held or not, is a pread,
+    // which leaves it untouched; so is a row with one page of each kind.
+    m.doubt(Ctl.stale_at);
+    try std.testing.expectEqual(Trust.touched, m.ctl.?.trust.load(.monotonic));
+    try std.testing.expect(m.copies(10, 256));
+    try std.testing.expect(holds(f.fd, page + 10, 256) and !m.copies(page + 10, 256));
+    try std.testing.expect(!m.copies(page - 100, 256));
+    try std.testing.expect(readRow(f.fd, &row, page + 10));
+    try std.testing.expectEqualSlices(u8, data[page + 10 ..][0..256], &row);
+    try std.testing.expect(m.bits(page + 10, 256) & Map.touched == 0);
+    try std.testing.expect(readRow(f.fd, &row, page - 100));
+    try std.testing.expectEqualSlices(u8, data[page - 100 ..][0..256], &row);
+    try std.testing.expect(m.bits(10, 256) & Map.touched != 0);
+    // As many page-ins again in a stretch of touched pages' copies: a few are the copies that were in flight.
+    m.doubt(Ctl.thrash_at - 1);
+    try std.testing.expect(m.copies(10, 256));
+    // Past `thrash_at`: the touched pages are being dropped too, and no row is a copy; rows read the same.
+    m.doubt(Ctl.thrash_at);
+    try std.testing.expectEqual(Trust.none, m.ctl.?.trust.load(.monotonic));
+    try std.testing.expect(!m.copies(10, 256));
+    try std.testing.expect(readRow(f.fd, &row, 10));
+    try std.testing.expectEqualSlices(u8, data[10..][0..256], &row);
+    try std.testing.expect(m.bits(10, 256) & Map.touched != 0);
+    // An old question: the kernel is asked at once, and its answer ends the suspicion and keeps what was touched.
+    m.ctl.?.asked_ns.store(0, .monotonic);
+    m.doubt(Ctl.stale_at);
+    settle(f.fd);
+    // The file's counts: one row copied, three read by pread, the kernel asked at the map and now, stale four times.
+    const c = counts(f.fd);
+    try std.testing.expectEqual(@as(u64, 1), c.copies);
+    try std.testing.expectEqual(@as(u64, 3), c.preads);
+    try std.testing.expectEqual(@as(u32, 2), c.asked);
+    try std.testing.expectEqual(@as(u32, 4), c.stale);
+    try std.testing.expectEqual(Trust.held, m.ctl.?.trust.load(.monotonic));
+    try std.testing.expect(holds(f.fd, 0, data.len));
+    try std.testing.expect(m.bits(10, 256) & Map.touched != 0);
+    try std.testing.expect(m.copies(page + 10, 256));
+}
+
+test "engram_direct map: the kernel's answer decides what is held, and a page it no longer holds is no longer touched" {
+    // Held and touched, still held: both kept. mincore's other bits (referenced, modified) are not `touched`.
+    try std.testing.expectEqual(Map.in_cache | Map.touched, merged(Map.in_cache | Map.touched, 1));
+    try std.testing.expectEqual(Map.in_cache, merged(Map.in_cache, 0x1f));
+    try std.testing.expectEqual(Map.in_cache, merged(0, 0x03));
+    // Dropped by the kernel: neither, whatever it was.
+    try std.testing.expectEqual(@as(u8, 0), merged(Map.in_cache | Map.touched, 0));
+    try std.testing.expectEqual(@as(u8, 0), merged(Map.in_cache, 0x1e));
 }

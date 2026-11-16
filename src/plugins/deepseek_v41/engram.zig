@@ -311,6 +311,11 @@ pub const Table = struct {
         edir.map(self.fd);
     }
 
+    /// The mapped file's rows so far (`edir.Counts`).
+    pub fn mapCounts(self: *const Table) edir.Counts {
+        return edir.counts(self.fd);
+    }
+
     /// Whether this read's rows are copies out of the map: faults on a mapping scale to about 32 threads, not 128.
     fn mapsRows(self: *const Table) bool {
         return edir.mapped(self.fd) and !self.past_cache.load(.acquire);

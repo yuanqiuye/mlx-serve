@@ -104,8 +104,13 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - Engram tables are read whole and past the page cache only beside a streamed bank (`Table.readDirect`): on a resident
   MLX pack the direct whole-grid read slowed warm prompts (the cache served their rows), and the bank needs that memory.
 - A mapped Engram table serves a row out of the map only from pages the page cache holds (`engram_direct.Map.held`:
-  the kernel's answer at the open and whenever timed copies wait on the drive, plus every page a pread has read); any
-  other row is a pread. Page faults on one file run one after another: a never-read prompt took six times as long.
+  the kernel's answer at the open, when it is ten seconds old and when copies page in from the drive, plus every page
+  a pread has read); any other row is a pread. Page faults that read the drive run one after another on one file: a
+  never-read prompt took six times as long.
+- Stale Engram residency never turns every row into a pread: rows on pages already copied from (`Map.touched`, about
+  95% of a prompt's row reads) stay copies, since preads of one file top out near 586,000 a second whatever the
+  threads. Staleness is the task's page-in count over a stretch of copies, never a copy's time: a first touch of a
+  cached page is slow too.
 - A resident pack reads its Engram CODES past the page cache while memory is tight (`Table.openCodes`, `pastCache`,
   `engram.cacheTight`: under an eighth of RAM free, asked at each prompt chunk), its scales always through it: with
   no room the cache evicted the scales to hold codes read once and every row cost two reads; with room the cache wins.

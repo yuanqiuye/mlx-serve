@@ -5106,7 +5106,11 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
         m.ced_stats.chunks += 1;
         m.ced_stats.skipped += L - tl;
         log.info("[dsv41] CED prefill: {d} rows encoder-only, replay {d} rows\n", .{ L - tl, tl });
-        if (prefetch) |pf| log.debug("[dsv41] the chunk waited {d} ms on its Engram rows{s}\n", .{ pf.waited_ms, if (m.engrams[0].table.past_cache.load(.acquire)) ", codes past the page cache" else "" });
+        if (prefetch) |pf| {
+            var rows: @TypeOf(m.engrams[0].table.mapCounts()) = .{};
+            for (m.engrams) |e| rows.add(e.table.mapCounts());
+            log.debug("[dsv41] the chunk waited {d} ms on its Engram rows{s}; mapped tables so far: {d} rows copied, {d} by pread, the kernel asked {d} times, {d} after stale copies\n", .{ pf.waited_ms, if (m.engrams[0].table.past_cache.load(.acquire)) ", codes past the page cache" else "", rows.copies, rows.preads, rows.asked, rows.stale });
+        }
         try runLayers(m, gpa, st, &tsp, held, enc_hi, m.n_layers);
         sp = tsp;
     }

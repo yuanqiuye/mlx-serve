@@ -853,7 +853,23 @@ Defect: a 133k-token prompt whose Engram rows were not in the page cache took 30
 loaded, or one whose 203 GB of FP8 tables the cache cannot hold whole) where preads took 32 s; a 1.4k-token prompt
 4.0 s for 0.6 s. Cause: every row was copied out of the map, and a row on a page the page cache does not hold is
 read by a page fault; faults on one file run one after another (28-56k rows a second on 32 threads, preads 190-310k).
-Fix: `engram_direct.Map` copies a row out of the map only from pages it takes as held (mincore at the open and again
-when timed copies wait on the drive, pages marked as preads read them) and reads every other row by pread.
+Fix: `engram_direct.Map` copies a row out of the map only from pages it takes as held (mincore at the open, again when
+the answer is ten seconds old and when copies paged in from the drive; pages marked as preads read them) and reads
+every other row by pread.
 Guard: `engram_direct map: a row is a pread until the page cache is known to hold its pages`.
+
+### Stale Engram residency turned every row of a prompt into a pread
+Defect: never-read 30k-token prompts read at 3,000-3,800 tok/s for 4,300 (DeepSeek-V4.1, the page cache holding
+73-90% of the tables: mean 3,380 and 3,991 over two rounds of seven), the GPU idle for a second or more in one chunk.
+Cause: once copies paged in from the drive, every row became a pread until a whole-file mincore returned (1.5-1.8 s
+a 74 GB table on one thread). Preads of one file top out near 586k a second whatever the threads, and about 95% of a
+prompt's row reads are of pages the process has already copied from, which cost nothing as copies: 2.3M preads in one
+26k-token prompt. An earlier detector timed the copies and took first touches of cached pages for drive reads (up to
+37% of timed copies "slow" with no page-in). Fix: under suspicion only rows on pages not yet copied from are preads
+(`Map.touched`; none are copies once touched pages page in too, `Ctl.thrash_at`); the kernel is asked on eight threads
+(0.35 s) into a scratch vector merged into `held`; staleness is the task's page-in count over a stretch of copies.
+Same prompts after: 4,083 and 4,238 tok/s, none under 3,900. Check: the debug log's `the chunk waited` line counts
+rows copied, rows by pread, questions to the kernel and stale answers.
+Guard: `engram_direct map: under suspicion a row is copied only out of pages copied from before` and `the kernel's
+answer decides what is held`.
 
