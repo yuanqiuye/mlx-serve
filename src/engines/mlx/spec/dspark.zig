@@ -239,8 +239,12 @@ pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?Dr
 /// steps (`PlainCost.seeded`).
 pub fn dsparkPolicy(plain: dflash_policy.PlainCost, ladder: dflash_policy.VerifyCost, pin_rows: u32) DflashPol {
     const weight: f32 = if (learnedLadder()) dflash_policy.Calibration.HEAD_WEIGHT else (dflash_policy.Calibration{}).prior_weight;
-    return .{ .calib = .{ .head = true, .prior_weight = weight }, .plain = plain, .ladder = ladder, .pin_rows = if (pin_rows != 0) pin_rows else pinRowsDiag() };
+    return .{ .calib = .{ .head = true, .prior_weight = weight }, .drafting = .{ .margin = if (learnedLadder()) BACKOFF_MARGIN else 1 }, .plain = plain, .ladder = ladder, .pin_rows = if (pin_rows != 0) pin_rows else pinRowsDiag() };
 }
+
+/// The value rule already drops the rows a doubtful draft would not pay for, so the backoff is left the stretches
+/// whose drafts are worth nothing: a round within a tenth of break-even keeps drafting.
+const BACKOFF_MARGIN: f32 = 0.9;
 
 var pin_rows_diag: ?u32 = null;
 /// The diag `dsv41-pin-rows=N`: every round verifies N rows where its draft has them (0: the policy chooses).

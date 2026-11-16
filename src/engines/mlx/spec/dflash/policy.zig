@@ -349,6 +349,9 @@ pub const Drafting = struct {
     owed: u32 = 0,
     /// Plain rounds the next losing round will owe.
     period: u32 = 1,
+    /// A round loses when its gain is under this share of its wall. Below 1 it keeps drafting through rounds a little
+    /// under break-even: skipping a stretch forgoes its good rounds too, which costs more than the drafts saved.
+    margin: f32 = 1,
     /// Rounds skipped, for stats.
     skipped: u64 = 0,
     /// Drafted rounds that followed a skip stretch.
@@ -381,7 +384,7 @@ pub const Drafting = struct {
             self.gain += ALPHA * (gain - self.gain);
             self.wall += ALPHA * (wall - self.wall);
         }
-        if (self.gain >= self.wall) {
+        if (self.gain >= self.wall * self.margin) {
             self.owed = 0;
             self.period = @max(1, self.period / 2);
         } else {
@@ -830,6 +833,22 @@ test "Drafting: a losing draft owes plain rounds, doubling to a cap; a winning p
     d.record(60, 10);
     try testing.expect(d.shouldDraft());
     try testing.expect(d.probes > 0 and d.skipped > 0);
+}
+
+test "Drafting: a margin keeps drafting through rounds a little under break-even, not through junk" {
+    var thin: Drafting = .{ .margin = 0.9 };
+    for (0..8) |_| {
+        try testing.expect(thin.shouldDraft());
+        thin.record(21, 22.4); // 0.94 of its cost: under break-even, inside the margin
+    }
+    var strict: Drafting = .{};
+    try testing.expect(strict.shouldDraft());
+    strict.record(21, 22.4);
+    try testing.expect(!strict.shouldDraft());
+    var junk: Drafting = .{ .margin = 0.9 };
+    try testing.expect(junk.shouldDraft());
+    junk.record(17.6, 22.4); // nothing kept: the plain step's tokens for a draft's cost on top
+    try testing.expect(!junk.shouldDraft());
 }
 
 test "Drafting: a thin win with scattered misses keeps drafting, because the rounds are weighed by their time" {
