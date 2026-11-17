@@ -452,6 +452,8 @@ pub const Dsv41Model = struct {
     /// Chunks that ran the decoder over their last window alone, the rows that skipped it, the chunks that put that
     /// replay off (`Want.encode_keep`) and the replays made later (`completeReplay`).
     ced_stats: struct { chunks: u64 = 0, skipped: u64 = 0, put_off: u64 = 0, made_later: u64 = 0 } = .{},
+    /// `MLX_SERVE_DSV41_CED_DEFER`: a prompt chunk the armed prompt continues past puts off its decoder replay.
+    ced_defer: bool = true,
     /// Threads per threadgroup of the hc kernels, all four alike so the wide and decode-width stages sum in one order.
     hc_tg: usize = HC_TG,
     /// Threads per top-k threadgroup (`probeTopkThreads`); the picks are the same at any width.
@@ -471,6 +473,8 @@ pub const Dsv41Model = struct {
     engrams: []EngramLayer = &.{},
     /// The request's prompt, whose later chunks' Engram rows are read while an earlier one runs.
     prompt: []u32 = &.{},
+    /// The state (`state_gen`) the prompt was armed on.
+    prompt_gen: u64 = 0,
     ahead: ?*engram.Prefetch = null,
     /// The rows the next call brings when this module cut a chunk itself (`extendCold`): what the read-ahead reads.
     next_rows: ?usize = null,
@@ -1959,6 +1963,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         }
     }
     m.chain = if (env.get(.MLX_SERVE_DSV41_CHAIN)) |v| v[0] != '0' else true;
+    m.ced_defer = if (env.get(.MLX_SERVE_DSV41_CED_DEFER)) |v| v[0] != '0' else true;
     if (!worker) if (opts.pack_dir) |dir| try initEngram(m, w, dir);
     {
         const k: usize = cfg.num_experts_per_tok;
@@ -6047,6 +6052,20 @@ pub fn completeReplay(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State) !void 
     log.info("[dsv41] CED prefill: the replay of {d} rows put off at {d} made now\n", .{ r.n, r.p0 + r.n });
 }
 
+/// Whether a prompt chunk `ids` at `st.n` puts off its decoder replay (`Want.encode_keep`): the chunk would replay,
+/// it is the armed prompt's own, no boundary is captured at its end, and what follows it is long enough to replay for
+/// itself. The decoder over a window is one read of the decoder layers' expert banks (125 GB, 0.13 s on an M5 Ultra,
+/// 6-7% of a chunk); only the prompt's last chunk needs it, or a state that must stand whole (`completeReplay`).
+fn putsOffReplay(m: *const Dsv41Model, st: *const State, ids: []const u32) bool {
+    // Another state's prompt, or one armed before this state was reset, says nothing of who reads this chunk's logits.
+    if (!m.ced_defer or m.dec_state == null or st != &m.dec_state.? or m.prompt_gen != m.state_gen) return false;
+    const need = m.cfg.sliding_window + m.ced_min_skip;
+    const p1 = st.n + ids.len;
+    if (ids.len < need or p1 + need > m.prompt.len) return false;
+    if (st.snap_at) |at| if (at == p1) return false;
+    return std.mem.eql(u32, ids, m.prompt[st.n..p1]);
+}
+
 fn cedReplayIn(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, tsp: *const Spans, li: usize) !void {
     try cedCompress(m, gpa, st, sp, li);
     var sc = Scope.init(gpa, m.s);
@@ -6280,7 +6299,11 @@ pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision:
 /// A fresh request's empty state.
 pub fn reset(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
     var fresh = try initState(m, gpa);
+    // A prompt armed on a state that has not moved stays armed on the one that replaces it, as its capture does (the
+    // plugin resets at position 0 after the engine armed the prompt).
+    var armed = false;
     if (m.dec_state) |*st| {
+        armed = st.n == 0 and m.prompt_gen == m.state_gen;
         fresh.snap_at = st.snap_at;
         fresh.snap_ids = st.snap_ids;
         fresh.snap_vision_key = st.snap_vision_key;
@@ -6290,6 +6313,7 @@ pub fn reset(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
     }
     newGen(m);
     m.dec_state = fresh;
+    if (armed) m.prompt_gen = m.state_gen;
 }
 
 fn newGen(m: *Dsv41Model) void {
@@ -6677,7 +6701,9 @@ pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: 
     m.dropAhead();
     m.gpa.free(m.prompt);
     m.prompt = &.{};
+    m.prompt_gen = 0;
     m.prompt = try m.gpa.dupe(u32, prompt);
+    m.prompt_gen = m.state_gen;
     const st = &m.dec_state.?;
     if (st.snap) |*sn| sn.deinit(st.gpa);
     st.snap = null;
@@ -6847,10 +6873,17 @@ const LEAD_MIN: usize = 4096;
 /// `extendIds` of a prompt chunk for its last row's logits, its lead (`leadRows`) run first without the decoder's
 /// replay, which the rest of the chunk makes at its own end.
 fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32, vision: ?VisionRows) !A {
-    const whole = m.engrams.len == 0 or m.pair != null or m.tp != null or m.streamed != null or m.trace != null or
-        m.ced_split == null or st.verify != null or !cedEnabled();
-    const lead = if (whole) 0 else leadRows(ids.len, if (m.ahead) |a| a.covers(st.n, ids.len) else false);
-    if (lead == 0) return extendIds(m, gpa, st, .{ .host = ids }, .last, vision);
+    const whole = m.pair != null or m.tp != null or m.streamed != null or m.trace != null or m.ced_split == null or
+        st.verify != null or !cedEnabled();
+    const lead = if (whole or m.engrams.len == 0) 0 else leadRows(ids.len, if (m.ahead) |a| a.covers(st.n, ids.len) else false);
+    // A chunk the armed prompt continues past leaves the decoder's replay to the prompt's last chunk: its logits are
+    // nobody's (the engine reads a prompt's logits after its last token), so it hands back a row of zeros.
+    const put_off = !whole and vision == null and putsOffReplay(m, st, ids);
+    const want: Want = if (put_off) .encode_keep else .last;
+    if (lead == 0) {
+        const out = try extendIds(m, gpa, st, .{ .host = ids }, want, vision);
+        return if (put_off) noLogits(m) else out;
+    }
     defer m.next_rows = null;
     m.next_rows = ids.len - lead;
     _ = try extendIds(m, gpa, st, .{ .host = ids[0..lead] }, .encode, vision);
@@ -6858,7 +6891,16 @@ fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u
     if (rest) |*v| v.offset += std.mem.count(u32, ids[0..lead], &.{m.cfg.image_token_id});
     // The prompt's next chunk is expected as wide as this whole one, not as its rest.
     m.next_rows = ids.len;
-    return extendIds(m, gpa, st, .{ .host = ids[lead..] }, .last, rest);
+    const out = try extendIds(m, gpa, st, .{ .host = ids[lead..] }, want, rest);
+    return if (put_off) noLogits(m) else out;
+}
+
+/// The logits of a chunk that made none (`Want.encode_keep`): one row of zeros (caller frees).
+fn noLogits(m: *const Dsv41Model) !A {
+    var z = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(z);
+    try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{ 1, ci(m.vocab) }, 2, .float32, m.s));
+    return z;
 }
 
 /// `extend` that takes the armed snapshot on the way: a chunk crossing its

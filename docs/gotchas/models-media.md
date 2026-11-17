@@ -914,3 +914,20 @@ same prompts beside the trace, each request count on its own`.
 Guard: `deepseek_v41 served: a plain batched step begun behind the step before it`, `a batched verify behind its
 draft`, `chained greedy group rounds emit the tokens`; on a pack `dsv41 group lead` (`DSV41_GROUP_LEAD`: the fixtures
 carry no Engram layer, and a verify behind a lead is judged against a second whole build of it, not against bits).
+
+### Every chunk of a long prompt read the decoder layers' expert banks for 128 rows nobody used
+Defect: a DeepSeek-V4.1 prompt of 65,536 tokens spent 0.8 of its 14.9 s (M5 Ultra) on the decoder's replay: each
+8,192-row chunk ran layers 20-39 over its last window, 0.12 s a chunk, to leave a state and a row of logits that the
+next chunk's own replay overwrote unread.
+Cause: the replay reads the decoder layers' expert banks whole (125 GB for 128 rows), and a chunk did not know whether
+another followed it. The module does: the engine arms the whole prompt before its first chunk (`armPrompt`).
+Fix: a chunk the armed prompt continues past, with enough rows left for the next chunk to replay for itself, runs its
+encoder alone and keeps its last window's encoder rows (`Want.encode_keep`, 10 MB); the replay is made by the prompt's
+last chunk, or by the first reader of the state that needs it whole (`completeReplay`: a decode step, a short chunk, a
+draft, a capture at a chunk end for an abandoned prompt). The prompt must be armed on the live state
+(`prompt_gen`): another request's prompt says nothing of who reads this chunk's logits. The plugin resets the state at
+position 0 AFTER the engine armed the prompt, so the arm follows the fresh state (`reset`): without that the module's
+own meter gained 5% and no cold prompt on the server put anything off. 14.90 to 14.09 s.
+Guard: `deepseek_v41 CED: a chunk that puts off its decoder replay leaves the prompt's end, a capture and a short
+chunk what a replay at every chunk leaves` (through the table as the engine reads a prompt: bit-equal logits and
+counted replays).

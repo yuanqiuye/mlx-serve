@@ -457,6 +457,87 @@ test "deepseek_v41 CED: a lead chunk that skips the decoder leaves what the chun
     }
 }
 
+/// An armed prompt of 80 tokens read through the plugin's table as the engine reads one (the prompt begun on a slot,
+/// then its chunks ending at `cuts`), then three decode steps: the logits after the last chunk and after each step.
+/// `abandon_at`: the prompt is given up once the slot stands there, its capture handed over and restored on another
+/// slot, which reads the rest.
+fn cedPrompt(t: *Twin, mdl: anytype, put_off: bool, cuts: []const usize, abandon_at: ?usize, out: *[4][]f32) !void {
+    const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+    var ids: [80]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(3 + (i * 37 + i * i) % 90);
+    mdl.ced_defer = put_off;
+    var slot: u32 = 1;
+    try testing.expect(aux.begin_prompt(t.m, slot, .of(&ids), .{}, 0, true).isOk());
+    defer v41.table.release_slot.?(t.m, slot);
+    var sn: abi.Handle = null;
+    defer aux.free(t.m, sn);
+    var at: usize = 0;
+    var last: []f32 = &.{};
+    errdefer testing.allocator.free(last);
+    for (cuts) |end| {
+        testing.allocator.free(last);
+        last = &.{};
+        last = try slotForward(t, .prefill, &.{slot}, ids[at..end], &.{@intCast(at)});
+        at = end;
+        if (abandon_at) |stop| if (at == stop) {
+            try testing.expect(aux.snapshot(t.m, slot, &sn).isOk());
+            try testing.expect(sn != null);
+            v41.table.release_slot.?(t.m, slot);
+            slot = 3;
+            try testing.expect(aux.restore_at(t.m, slot, sn, at).isOk());
+            try testing.expect(aux.begin_prompt(t.m, slot, .of(&ids), .{}, at, false).isOk());
+        };
+    }
+    out[0] = last;
+    for (out[1..], [_]u32{ 5, 9, 13 }, 0..) |*o, tok, k| o.* = try slotForward(t, .decode, &.{slot}, &.{tok}, &.{@intCast(at + k)});
+}
+
+test "deepseek_v41 CED: a chunk that puts off its decoder replay leaves the prompt's end, a capture and a short chunk what a replay at every chunk leaves" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    const model: *v41.Model = @ptrCast(@alignCast(t.m));
+    const mdl = model.mdl;
+    try testing.expect(mdl.ced_split != null);
+    const w: usize = mdl.cfg.sliding_window;
+    const was = .{ mdl.ced_min_skip, mdl.span, mdl.ced_defer };
+    defer {
+        mdl.ced_min_skip = was[0];
+        mdl.span = was[1];
+        mdl.ced_defer = was[2];
+    }
+    mdl.ced_min_skip = w; // a chunk of two windows replays its last one
+    mdl.span = 12; // a chunk is several spans, and its last window straddles two
+    const Case = struct { cuts: []const usize, abandon_at: ?usize, put_off: u64, made_later: u64 };
+    const cases = [_]Case{
+        // The prompt's chunks as the engine cuts them: the first two put the replay off, the one that ends at the
+        // capture's boundary (79) makes its own, and nothing is made later.
+        .{ .cuts = &.{ 24, 48, 79, 80 }, .abandon_at = null, .put_off = 2, .made_later = 0 },
+        // Given up after two chunks: the capture taken there is the state whole.
+        .{ .cuts = &.{ 24, 48, 79, 80 }, .abandon_at = 48, .put_off = 2, .made_later = 1 },
+        // A chunk too short to replay for itself follows one that put its replay off: the replay is made first.
+        .{ .cuts = &.{ 24, 30, 79, 80 }, .abandon_at = null, .put_off = 1, .made_later = 1 },
+        // The prompt stops short of what was armed and decode steps follow a chunk that put its replay off: that
+        // chunk's own logits are the one thing that differs (nobody was to read them).
+        .{ .cuts = &.{ 24, 48 }, .abandon_at = null, .put_off = 2, .made_later = 1 },
+    };
+    for (cases) |case| {
+        var want: [4][]f32 = undefined;
+        var got: [4][]f32 = undefined;
+        try cedPrompt(t, mdl, false, case.cuts, case.abandon_at, &want);
+        defer for (want) |l| testing.allocator.free(l);
+        const before = mdl.ced_stats;
+        try cedPrompt(t, mdl, true, case.cuts, case.abandon_at, &got);
+        defer for (got) |l| testing.allocator.free(l);
+        try testing.expectEqual(case.put_off, mdl.ced_stats.put_off - before.put_off);
+        try testing.expectEqual(case.made_later, mdl.ced_stats.made_later - before.made_later);
+        const whole = case.cuts[case.cuts.len - 1] == 80;
+        for (want[@intFromBool(!whole)..], got[@intFromBool(!whole)..]) |x, y| try testing.expectEqualSlices(f32, x, y);
+    }
+}
+
 /// The logits of `tail` on a slot restored from `sn` at its end (the prompt `ids`).
 fn restoredTail(t: *Twin, aux: *const abi.AuxHooks, sn: abi.Handle, ids: []const u32, tail: []const u32) ![]f32 {
     const n = ids.len - tail.len;

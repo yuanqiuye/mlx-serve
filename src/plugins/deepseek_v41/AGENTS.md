@@ -171,6 +171,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - A prompt chunk of 4096 rows or more that nothing read ahead runs as its first half, then the rest (`extendCold`,
   `leadRows`; the lead is `Want.encode`: no decoder replay, which the rest makes): the drive reads the rest's Engram
   rows behind the lead. The log's `waited ... ms` is the meter.
+- A chunk the armed prompt continues past puts off its decoder replay (`Want.encode_keep`, `putsOffReplay`) and hands
+  back no logits: the decoder windows, DSpark windows and `mh` are stale until `completeReplay`. Whatever reads that
+  state (a step, a draft, a capture) calls it first. `MLX_SERVE_DSV41_CED_DEFER=0`: every chunk replays.
 - Construct each MPP cooperative tensor from its owning op; copying one invokes incompatible Metal layout
   interfaces on some SDKs. Fill each operand's independent storage before running the matmul.
 
@@ -205,8 +208,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   pre-NAX split kernel and the compiled regions. The affine `moe_up` / `moe_down` stay off too (they lose to the
   compiled MoE there); `moe_fp4` is the non-NAX one.
 - Prefill is chunked at 8192 at most (`prefillChunkMax`, an explicit `--prefill-chunk` included), one MoE call per
-  chunk: each chunk still reads every expert bank once (the CED replay runs the decoder layers), so a narrower chunk
-  pays that read twice as often.
+  chunk: each chunk reads every encoder layer's expert bank once (and the decoder layers' where it replays), so a
+  narrower chunk pays that read twice as often.
 - Past 0.95 x Metal's working set MLX's allocator evicts its buffer cache on every miss (two residency commits per
   allocation): DSpark at 8192 crosses it on a 256 GB Mac at the default `iogpu.wired_limit_mb`; raise it to bench.
 - DSpark on prose falls back to plain (acceptance 1.04/round): correct, prose runs ~54 tok/s.
