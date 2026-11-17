@@ -36,12 +36,15 @@ pub const MAX_SLOTS: usize = dflash_policy.MAX_GROUP_ROWS;
 
 var stage_slots_max: ?usize = null;
 
-/// The most slots a group round still drafts with the stages for (`MLX_SERVE_DSV41_GROUP_DRAFT_MAX`, 4): from 5
-/// requests decoding together the plain batched step gave more tokens a second than any drafting on an M5 Ultra
-/// (8 different requests, greedy: 5 at once 119 against 118, 6: 129 against 123, 8: 135 against 129), every request's
-/// distinct experts filling the step. A copy from the context costs no draft pass and is drafted at any count.
+/// The most slots a group round still drafts with the stages for (`MLX_SERVE_DSV41_GROUP_DRAFT_MAX`, 3). A plain batched
+/// step whose first layers run behind the step before it (`dsv41_mod.leadBatched`) costs 2-3% less than one the host
+/// builds after its read, and a row bought beside three other requests costs 5 ms against 3.9 alone: on an M5 Ultra,
+/// greedy, 4 different requests decode 120 tok/s on plain steps against 113-117 drafting (long prose; 117 against
+/// 112-115 on short mixed tasks), 3 requests 105 against 102-104 on prose and 104 against 105-107 on the tasks, 2
+/// requests 89 against 92 and 87 against 93. From 5 the plain step won before the lead (8 requests: 135 against 129).
+/// A copy from the context costs no draft pass and is drafted at any count.
 fn stageSlotsMax() usize {
-    if (stage_slots_max == null) stage_slots_max = if (env.get(.MLX_SERVE_DSV41_GROUP_DRAFT_MAX)) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 4 else 4;
+    if (stage_slots_max == null) stage_slots_max = if (env.get(.MLX_SERVE_DSV41_GROUP_DRAFT_MAX)) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 3 else 3;
     return stage_slots_max.?;
 }
 

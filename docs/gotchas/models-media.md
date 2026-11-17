@@ -891,3 +891,26 @@ Check: `[spec-stats] mode=dspark ... chained= led=` counts the rounds that ran s
 tables out of the page cache (40% of both): read them back before judging a trace, or the rows wait on the drive.
 Guard: `deepseek_v41 DSpark: a draft launched behind its verify`, `dsv41 lead: a layer stopped before its routed
 experts`, `DSpark verdict on the GPU`.
+
+### Requests decoding together left the GPU idle between steps, and filling it made four of them slower
+Defect: DeepSeek-V4.1 requests decoding together kept an M5 Ultra's GPU busy 96.7% (2 requests), 97.2% (4) and 98.2%
+(8) of the time, each step waiting about 0.45 ms on the host: the read of its draws, the round's bookkeeping, the next
+step's Engram rows (0.7 ms at 8 requests) and its first layer's graph.
+Cause: the rounds one request chains on the GPU (the story above) were a path of their own for several requests. The
+first fix, the next step's first layer behind the draws, closed half the gap at 8 requests: the layer ran 1.3 ms and
+the host needed 1.6-1.8 ms to hand over the one after it. MLX also holds the host ten command buffers ahead of the GPU
+(`MAX_ACTIVE_TASKS`), so at 8 requests the host is blocked inside `async_eval` half of every step and what it queues
+reaches the GPU late; a profile reads that as slow graph building.
+Fix: the lead goes on through the Engram layer the moment the tokens are read (`leadBatchedOn`), a round's draft is
+launched behind the step before it from draws or verdicts the GPU still holds (`dsparkDraftAheadBatched`,
+`dsparkDraftAheadVerify`), a verify's first rows run behind its draft (`DraftLead`, `leadRest`), and every verdict is
+handed to the GPU before anything is queued behind the step (`stochasticBegin`). Busy 99.3-99.6% at 2, 4 and 8
+requests, greedy and sampled. The chained draft cost 2.9 ms where the host-built one cost 4.4, the backoff then
+drafted in three rounds of four, and four requests decoded 2.5% SLOWER at a higher busy share: a bought row costs 5 ms
+beside three other requests. Stage drafts now stop at 3 requests (`MLX_SERVE_DSV41_GROUP_DRAFT_MAX`): 4 requests 115.2
+to 120.4 tok/s, 2 requests 87.0 to 91.3, 8 requests 139.4 to 141.0, 3 requests level (long prose, greedy).
+Rule: `a busier GPU is a cheaper step, and a cheaper step moves every policy priced on it: read tokens a second on the
+same prompts beside the trace, each request count on its own`.
+Guard: `deepseek_v41 served: a plain batched step begun behind the step before it`, `a batched verify behind its
+draft`, `chained greedy group rounds emit the tokens`; on a pack `dsv41 group lead` (`DSV41_GROUP_LEAD`: the fixtures
+carry no Engram layer, and a verify behind a lead is judged against a second whole build of it, not against bits).
