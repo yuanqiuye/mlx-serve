@@ -691,6 +691,8 @@ pub const Table = struct {
         var pos: [GCD_ROWS]u32 = undefined;
         var np: usize = 0;
         if (edec.take(self.fd, job.ids, self.wlen, self.slen, bl, job.w, job.s, job.b, held[0..n]) == n) return;
+        // Rows an early read is still reading (`readEarly`) come from it, not from a second read beside it.
+        if (edec.settle(self.fd) and edec.take(self.fd, job.ids, self.wlen, self.slen, bl, job.w, job.s, job.b, held[0..n]) == n) return;
         for (held[0..n], 0..) |h, i| if (!h) {
             pos[np] = @intCast(i);
             np += 1;

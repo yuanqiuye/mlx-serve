@@ -35,8 +35,9 @@ pub const default_mb: u32 = 256;
 pub const max_mb: u32 = 16384;
 /// The decode reads' pool (the caller reads beside it).
 pub const pool_threads = 64;
-/// The most ids one early read takes (engram.zig's `MAX_COLS`), and the tables it may serve.
-pub const max_early = 112;
+/// The most ids one early read takes (a verify block's rows, 24 ids a row and table in the release; a wider read is
+/// left to the verify), and the tables it may serve.
+pub const max_early = 192;
 pub const max_tables = 4;
 /// The longest row part (codes, scales or biases) an early read holds.
 pub const max_part = 512;
@@ -419,6 +420,17 @@ pub fn early(slot: usize, ctx: *const anyopaque, read: ReadFn, fd: c_int, wlen: 
     dispatch_async_f(dispatch_get_global_queue(qos_user_initiated, 0), e, Early.run);
 }
 
+/// Table `fd`'s early read in flight waited for; whether there was one. A decode read that missed rows asks: the
+/// early read began first, so its rows land sooner than a second read of them would.
+pub fn settle(fd: c_int) bool {
+    var waited = false;
+    for (&ps().early_jobs) |*e| while (e.busy.load(.acquire) and e.fd == fd) {
+        waited = true;
+        std.Thread.yield() catch {};
+    };
+    return waited;
+}
+
 /// At a table's close: the early reads in flight waited for, then the LRU let go of (the next load makes a new one; a
 /// later table may take the same descriptor).
 pub fn forget(fd: c_int) void {
@@ -580,4 +592,12 @@ test "engram decode early read: the ids the LRU does not hold read on a GCD work
     early(1, &tag, Fake.read, fd, 2, 1, 0, &.{ 5, 6 });
     while (ps().early_jobs[1].busy.load(.acquire)) std.Thread.yield() catch {};
     try testing.expectEqual(@as(usize, 1), Fake.calls);
+    // A read that asks while an early read is in flight waits for it and finds its rows; with none in flight it
+    // does not wait.
+    try testing.expect(!settle(fd));
+    early(1, &tag, Fake.read, fd, 2, 1, 0, &.{ 9, 11 });
+    _ = settle(fd);
+    try testing.expect(!ps().early_jobs[1].busy.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), take(fd, &.{ 9, 11 }, 2, 1, 0, w[0..4], s[0..2], &.{}, held[0..2]));
+    try testing.expect(!settle(fd + 1));
 }

@@ -119,7 +119,7 @@ fn nativeSampledRound(self: *Generator, allocator: std.mem.Allocator, cap: u32) 
     errdefer if (!closed) {
         _ = plugin_driver.nativeFinish(self.xfm, &self.ctx, 0) catch 0;
     };
-    const verdict = try stochasticVerdict(self, v.logits, ids, self.xfm.config.vocab_size, cap);
+    const verdict = try stochasticVerdict(self, v.logits, ids, self.xfm.config.vocab_size, cap, null);
     closed = true;
     const position = try plugin_driver.nativeFinish(self.xfm, &self.ctx, verdict.accepted);
     const tokens = try allocator.dupe(u32, ids[0 .. 1 + verdict.accepted]);
@@ -175,6 +175,10 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     defer copy.deinit(allocator);
     const st = &mdl.dec_state.?;
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+    // Copies come in runs: the round after this one is likely another, which takes no stage draft.
+    mdl.ds_chain = false;
+    // A stage draft launched behind the last verify runs ahead of this copy's verify: not a time the ladder learns.
+    const behind_draft = dsv41_mod.draftInFlight(mdl);
     const verify_watch = io_util.Stopwatch.init(self.timer.io);
     const round = if (self.dspark_stochastic)
         try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &copy)
@@ -182,7 +186,7 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &copy, cap);
     if (self.dspark_pol) |*pol| {
         const copy_ms = msSince(&verify_watch);
-        sampleVerifyMs(self, n + 1, copy_ms);
+        if (!behind_draft) sampleVerifyMs(self, n + 1, copy_ms);
         pol.rate.record(@floatFromInt(round.tokens.len), copy_ms, pol.plain.ms);
     }
     self.dspark_copies += 1;
@@ -340,6 +344,12 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     const pol = &self.dspark_pol.?;
     const st = &mdl.dec_state.?;
     const t1 = self.next_token_id;
+    const chained0 = mdl.ds_chained;
+    const led0 = mdl.ds_led;
+    defer {
+        self.dspark_chained += mdl.ds_chained - chained0;
+        self.dspark_led += mdl.ds_led - led0;
+    }
     var d = if (acceptTrace()) try dsv41_mod.dsparkDraftKeep(mdl, allocator, st, t1) else try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
     defer d.deinit(allocator);
     pol.ladder.sampleDraft(@as(f32, @floatFromInt(mdl.ds_draft_ns)) / @as(f32, std.time.ns_per_ms));
@@ -355,13 +365,19 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
         d.len = expected.?.rows - 1;
     } else d.len = dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+    // With tokens left after this round's, the next round drafts from the stages too: its draft may go to the GPU
+    // behind this round's verify (`dsv41_mod.dsparkDraftAhead`).
+    mdl.ds_chain = cap > 0 and !acceptTrace();
+    const launched0 = mdl.ds_launched;
     const verify_watch = io_util.Stopwatch.init(self.timer.io);
     const round = if (self.dspark_stochastic)
         try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d)
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
     const verify_ms = msSince(&verify_watch);
-    if (d.len == 0) samplePlainMs(self, verify_ms);
+    // A verify of t1 alone is a plain step's time, unless the next draft ran behind it: its first kernels overlap
+    // the verify's last.
+    if (d.len == 0 and mdl.ds_launched == launched0) samplePlainMs(self, verify_ms);
     sampleVerifyMs(self, d.len + 1, verify_ms);
     if (roundTrace()) {
         var buf: [160]u8 = undefined;
@@ -449,7 +465,8 @@ pub fn nextDraw(self: *Generator) SamplingParams {
 pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype, t1: u32, accepted_cap: u32, copy: ?*const mod.DsparkDraft) !mod.DsparkRound {
     var pending = if (copy) |d| try mod.dsparkBeginWith(mdl, allocator, &mdl.dec_state.?, t1, d) else try mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
     defer pending.deinit();
-    const verdict = try stochasticVerdict(self, pending.vl_g, pending.verify[0 .. pending.b + 1], mdl.vocab, accepted_cap);
+    const behind: ?Behind = if (mod == dsv41_mod and dsv41_mod.aheadFits(mdl, &mdl.dec_state.?)) .{ .ctx = mdl, .launch = dsv41Behind } else null;
+    const verdict = try stochasticVerdict(self, pending.vl_g, pending.verify[0 .. pending.b + 1], mdl.vocab, accepted_cap, behind);
     if (acceptTrace()) if (copy) |d| traceAccept(pending.vl_g, pending.verify[0 .. pending.b + 1], d.logits, mdl.vocab, verdict.accepted);
     pending.lapVerify(mdl);
 
@@ -461,11 +478,89 @@ pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, com
 /// A sampled round's outcome: the drafts kept and the token pending after them.
 pub const Verdict = struct { accepted: u32, next_token: u32 };
 
+/// What a round hands the GPU behind its verdict before the host reads it: `launch` takes the drafts kept (an int32
+/// scalar) and the token after them (`[1]` int32), both still lazy.
+pub const Behind = struct {
+    ctx: *anyopaque,
+    launch: *const fn (ctx: *anyopaque, kept: mlx.mlx_array, next: mlx.mlx_array) anyerror!void,
+};
+
+fn dsv41Behind(ctx: *anyopaque, kept: mlx.mlx_array, next: mlx.mlx_array) anyerror!void {
+    const mdl: *dsv41_mod.Dsv41Model = @ptrCast(@alignCast(ctx));
+    try dsv41_mod.dsparkDraftAhead(mdl, &mdl.dec_state.?, kept, next);
+}
+
+/// `stays` (`[b]` bool, a draft's own test) as the verdict the host reads off it, on the GPU: the drafts kept are
+/// those before the first that fails, at most `cap`, and the next token is `corr`'s at that count. Caller frees both.
+fn lazyVerdict(stays: mlx.mlx_array, corr: mlx.mlx_array, b: u32, cap: u32, s: mlx.mlx_stream) ![2]mlx.mlx_array {
+    var hit = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hit);
+    try mlx.check(mlx.mlx_astype(&hit, stays, .int32, s));
+    var hits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hits);
+    try mlx.check(mlx.mlx_cumsum(&hits, hit, 0, false, true, s));
+    var upto = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(upto);
+    try mlx.check(mlx.mlx_arange(&upto, 1, @floatFromInt(b + 1), 1, .int32, s));
+    var run = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(run);
+    try mlx.check(mlx.mlx_equal(&run, hits, upto, s));
+    var run_i = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(run_i);
+    try mlx.check(mlx.mlx_astype(&run_i, run, .int32, s));
+    var count = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(count);
+    try mlx.check(mlx.mlx_sum_axis(&count, run_i, 0, false, s));
+    const most = mlx.mlx_array_new_int(@intCast(@min(cap, b)));
+    defer _ = mlx.mlx_array_free(most);
+    var kept = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(kept);
+    try mlx.check(mlx.mlx_minimum(&kept, count, most, s));
+    var at = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(at);
+    try mlx.check(mlx.mlx_take_axis(&at, corr, kept, 0, s));
+    var next = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(next);
+    try mlx.check(mlx.mlx_reshape(&next, at, &[_]c_int{1}, 1, s));
+    return .{ kept, next };
+}
+
+/// Each draft's own test under the acceptance rule `rule`, as the host applies it (`[b]` bool; caller frees):
+/// typical keeps a draft whose probability `accept_p` is over its row's floor `accept_q`; exact keeps it when the
+/// round's next uniform draw falls under its probability, the draws taken from `prng_in`, a copy of the request's
+/// generator, so the host's loop draws the same ones. Null for a rule that is not one test a position (TokenV3
+/// draws only where it defers).
+fn lazyStays(rule: mtp_acceptance.Mode, prng_in: std.Random.DefaultPrng, accept_p: mlx.mlx_array, accept_q: mlx.mlx_array, b: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    var stays = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(stays);
+    switch (rule) {
+        .typical => try mlx.check(mlx.mlx_greater(&stays, accept_p, accept_q, s)),
+        .exact => {
+            var prng = prng_in;
+            var u: [16]f32 = undefined;
+            for (u[0..b]) |*x| x.* = prng.random().float(f32);
+            const draws = mlx.mlx_array_new_data(&u, &[_]c_int{@intCast(b)}, 1, .float32);
+            defer _ = mlx.mlx_array_free(draws);
+            const one = mlx.mlx_array_new_float(1.0);
+            defer _ = mlx.mlx_array_free(one);
+            var p = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(p);
+            try mlx.check(mlx.mlx_minimum(&p, accept_p, one, s));
+            try mlx.check(mlx.mlx_less(&stays, draws, p, s));
+        },
+        .tokenv3 => {
+            _ = mlx.mlx_array_free(stays);
+            return null;
+        },
+    }
+    return stays;
+}
+
 /// The sampled accept of a verify chunk: `verify` is `[t1, drafts...]` and `vl_g` its logits `[rows, vocab]`. Keeps each
 /// draft (a point mass) with the probability the request's filtered density gives it; the token pending after the kept
 /// prefix is the residual sample at the first reject, or the bonus draw from the last row on a full accept. With
 /// MLX_SERVE_KEYED_SAMPLING a keyed request takes the serial verdict instead.
-pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32) !Verdict {
+pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32, behind: ?Behind) !Verdict {
     if (env.on(.MLX_SERVE_KEYED_SAMPLING) and keyedSerial(self.sampling)) return serialVerdict(self, vl_g, verify, vocab, accepted_cap);
     const s = self.xfm.s;
     const b: u32 = @intCast(verify.len - 1);
@@ -496,6 +591,14 @@ pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const 
         var samp_i = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(samp_i);
         try mlx.check(mlx.mlx_astype(&samp_i, sampled, .int32, s));
+        if (behind) |bh| {
+            const none_kept = mlx.mlx_array_new_int(0);
+            defer _ = mlx.mlx_array_free(none_kept);
+            var next = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(next);
+            try mlx.check(mlx.mlx_reshape(&next, samp_i, &[_]c_int{1}, 1, s));
+            try bh.launch(bh.ctx, none_kept, next);
+        }
         try mlx.check(mlx.mlx_array_eval(samp_i));
         var v: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&v, samp_i));
@@ -521,6 +624,15 @@ pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const 
         };
         defer bg.deinit();
 
+        // The same verdict picked on the GPU, for what goes behind it (`Behind`).
+        var lazy: ?[2]mlx.mlx_array = null;
+        defer if (lazy) |l| for (l) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        if (behind != null and b <= 16) if (try lazyStays(self.dspark_accept, self.prng, bg.accept_p, bg.accept_q, b, s)) |stays| {
+            defer _ = mlx.mlx_array_free(stays);
+            lazy = try lazyVerdict(stays, bg.corr_samples, b, accepted_cap, s);
+        };
         // ONE bounded sync: the accept vector + pre-sampled corrections
         // (and the whole verify graph beneath them) in one batched eval.
         {
@@ -528,8 +640,12 @@ pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const 
             defer _ = mlx.mlx_vector_array_free(ev);
             var buf: [4]mlx.mlx_array = undefined;
             for (bg.readouts(&buf)) |a| _ = mlx.mlx_vector_array_append_value(ev, a);
+            if (lazy) |l| for (l) |a| {
+                _ = mlx.mlx_vector_array_append_value(ev, a);
+            };
             try mlx.check(mlx.mlx_async_eval(ev));
         }
+        if (lazy) |l| try behind.?.launch(behind.?.ctx, l[0], l[1]);
         try mlx.check(mlx.mlx_array_eval(bg.accept_p));
         const p_data = mlx.mlx_array_data_float32(bg.accept_p) orelse return error.MlxArrayDataNull;
         switch (self.dspark_accept) {
@@ -897,6 +1013,51 @@ test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)"
         }
         std.debug.print("dsv4 nextDspark (generator): first_div={d}/{d}, rounds={d}, accepts={d}\n", .{ first_div, want, gen.dspark_attempted, gen.dspark_accepted_tokens });
     }
+}
+
+test "DSpark verdict on the GPU: the drafts kept and the token after them are the host's, typical and exact, capped" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const corr_v = [_]i32{ 70, 71, 72, 73, 74, 75 };
+    const floor_v = [_]f32{ 0.2, 0.2, 0.2, 0.2, 0.2 };
+    const cases = [_][5]f32{
+        .{ 0.9, 0.8, 0.7, 0.6, 0.5 },
+        .{ 0.1, 0.9, 0.9, 0.9, 0.9 },
+        .{ 0.9, 0.9, 0.2, 0.9, 0.9 },
+        .{ 0.9, 0.9, 0.9, 0.9, 0.19 },
+        .{ 0.3, 0.6, 0.4, 0.7, 0.35 },
+    };
+    var checked: usize = 0;
+    for (cases) |p_v| for ([_]u32{ 1, 3, 5 }) |b| for ([_]u32{ 0, 2, 9 }) |cap| for ([_]mtp_acceptance.Mode{ .exact, .{ .typical = .{ .delta = 0.4 } } }) |rule| for (0..4) |seed| {
+        const corr = mlx.mlx_array_new_data(&corr_v, &[_]c_int{@intCast(b + 1)}, 1, .int32);
+        defer _ = mlx.mlx_array_free(corr);
+        const p = mlx.mlx_array_new_data(&p_v, &[_]c_int{@intCast(b)}, 1, .float32);
+        defer _ = mlx.mlx_array_free(p);
+        const q = mlx.mlx_array_new_data(&floor_v, &[_]c_int{@intCast(b)}, 1, .float32);
+        defer _ = mlx.mlx_array_free(q);
+        var prng = std.Random.DefaultPrng.init(seed);
+        const stays = (try lazyStays(rule, prng, p, q, b, s)).?;
+        defer _ = mlx.mlx_array_free(stays);
+        const lazy = try lazyVerdict(stays, corr, b, cap, s);
+        defer for (lazy) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const host = @min(cap, switch (rule) {
+            .exact => mtp_acceptance.exactPrefix(p_v[0..b], null, null, &prng),
+            else => mtp_acceptance.typicalPrefix(p_v[0..b], floor_v[0..b], null, &prng),
+        });
+        var kept: i32 = -1;
+        var next: i32 = -1;
+        try mlx.check(mlx.mlx_array_item_int32(&kept, lazy[0]));
+        try mlx.check(mlx.mlx_array_item_int32(&next, lazy[1]));
+        try testing.expectEqual(@as(i32, @intCast(host)), kept);
+        try testing.expectEqual(corr_v[host], next);
+        try testing.expectEqual(@as(usize, 0), mlx.mlx_array_ndim(lazy[0]));
+        checked += @intFromBool(host > 0 and host < b);
+    };
+    try testing.expect(checked > 20); // partial prefixes, not only all or nothing
+    const none = try lazyStays(.{ .tokenv3 = 0.9 }, std.Random.DefaultPrng.init(0), mlx.mlx_array_new(), mlx.mlx_array_new(), 1, s);
+    try testing.expect(none == null);
 }
 
 test "nextDraw: each stochastic DSpark round takes a fresh draw of the request's seed" {

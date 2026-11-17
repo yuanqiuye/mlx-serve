@@ -167,6 +167,10 @@ pub const Generator = struct {
     dspark_accepted_tokens: u64 = 0,
     /// Rounds whose drafts were copied from the context (`dsparkCopyStep`), included in `dspark_attempted`.
     dspark_copies: u64 = 0,
+    /// Stage rounds whose draft ran behind the verify before it, and whose verify began behind its draft
+    /// (`dsv41_mod.dsparkDraftAhead`).
+    dspark_chained: u64 = 0,
+    dspark_led: u64 = 0,
     dspark_copy_drafted: u64 = 0,
     dspark_copy_accepted: u64 = 0,
     /// DeepSeek-V4.1's stage rounds under `dflash_policy` (verify rows by the confidence head, plain ticks

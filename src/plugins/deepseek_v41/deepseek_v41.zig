@@ -545,6 +545,41 @@ pub const Dsv41Model = struct {
     /// and the draft's rows read half the head's bytes (1.3 ms of a 3.2 ms draft was the dense head's 1.3 GB).
     /// Null where the trunk's head is already quantized, a plugin's, or `MLX_SERVE_DSV41_DRAFT_HEAD8` is not set to 1.
     draft_head: ?Lin = null,
+    /// The last draft's arrays, let go once the verify after it is with the GPU (`dsparkBeginWith`): freed between
+    /// the draft's read and the verify's first layer, they were GPU idle time every round.
+    draft_scope: ?Scope = null,
+    /// `MLX_SERVE_DSV41_CHAIN`: a round's next draft and next verify go to the GPU behind the step before them.
+    chain: bool = true,
+    /// Set by the engine for the round in hand: the round after it is expected to draft from the stages, so this one
+    /// may launch that draft behind its verify (`dsparkDraftAhead`).
+    ds_chain: bool = false,
+    /// The next round's draft, handed to the GPU behind the verify in hand (`dsparkDraftAhead`).
+    next_draft: ?Ahead = null,
+    /// The next verify's first layers, handed to the GPU behind the draft in hand (`leadVerify`).
+    lead: ?Lead = null,
+    /// When the last verdict was read and when the draft in hand began (`monoUs`): a draft launched behind a verify
+    /// has run since that verify's verdict.
+    ds_verdict_us: i64 = 0,
+    ds_draft_us: i64 = 0,
+    /// Drafts launched behind a verify, those of them read, and verifies that took a lead behind a draft.
+    ds_launched: u64 = 0,
+    ds_chained: u64 = 0,
+    ds_led: u64 = 0,
+
+    fn dropDraftScope(self: *Dsv41Model) void {
+        if (self.draft_scope) |*sc| sc.deinit();
+        self.draft_scope = null;
+    }
+
+    fn dropNextDraft(self: *Dsv41Model) void {
+        if (self.next_draft) |*a| a.deinit();
+        self.next_draft = null;
+    }
+
+    fn dropLead(self: *Dsv41Model) void {
+        if (self.lead) |*l| l.deinit();
+        self.lead = null;
+    }
 
     fn dropAhead(self: *Dsv41Model) void {
         if (self.ahead) |a| a.finish();
@@ -556,6 +591,9 @@ pub const Dsv41Model = struct {
         sx1.releaseAll();
         // dense_keep.zig: so are the prompt's dequantized weights (their keys are this model's handles).
         dkeep.releaseAll();
+        self.dropDraftScope();
+        self.dropNextDraft();
+        self.dropLead();
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
         self.gpa.free(self.prompt);
@@ -1892,6 +1930,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             log.info("deepseek_v41: DSpark drafts through an 8-bit copy of the lm head (MLX_SERVE_DSV41_DRAFT_HEAD8=1; unset: the dense head)\n", .{});
         }
     }
+    m.chain = if (env.get(.MLX_SERVE_DSV41_CHAIN)) |v| v[0] != '0' else true;
     if (!worker) if (opts.pack_dir) |dir| try initEngram(m, w, dir);
     {
         const k: usize = cfg.num_experts_per_tok;
@@ -2280,6 +2319,9 @@ pub const Verify = struct {
     pend_kv: []A,
     pend_gate: []A,
     mh: A = none,
+    /// Per DSpark stage, every chunk row's window row as its ring keeps it: set by a draft launched behind the
+    /// verify (`dsparkDraftAhead`), which read them; the kept ones are the rows the windows then take.
+    kv: []A = &.{},
 };
 
 pub const State = struct {
@@ -2320,6 +2362,10 @@ pub const State = struct {
             _ = mlx.mlx_array_free(x);
         };
         if (v.mh.ctx != null) _ = mlx.mlx_array_free(v.mh);
+        for (v.kv) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+        self.gpa.free(v.kv);
         self.gpa.free(v.comp_used);
         self.gpa.free(v.idx_used);
         self.gpa.free(v.pend_kv);
@@ -4713,6 +4759,12 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
 /// `block` for at most `dkern.max_rows` rows on the fused decode kernels (`decode/`), today's stretches where one is
 /// missing; null (before any state moves) where a kernel declines the layer.
 fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !?A {
+    return blockFusedTo(sc, m, st, li, x, pre, p0, sh, null);
+}
+
+/// `blockFused`; with `routes`, the block stops before its routed experts where the router ran on the fused
+/// launches: `routes` then holds what `fusedExperts` finishes it from, row by row, and `pre` is left alone.
+fn blockFusedTo(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared, routes: ?*?dkern.ffn_in.Out) !?A {
     const kp = &(m.dec.in_proj orelse return null);
     const kq = m.dec.wq_b orelse return null;
     const ly = &m.layers[li];
@@ -4739,8 +4791,12 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &w.sa)) |f| {
+        if (routes) |r| {
+            r.* = f;
+            return f.x1;
+        }
         pre.* = f.sf.pre;
-        return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
+        return try fusedExperts(sc, m, ly, &f);
     };
     var ao: [1]A = undefined;
     if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
@@ -4749,6 +4805,12 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     try runRegion(sc, m, li, .ffn, &.{ x, ao[0], w.sa.pre, w.sa.post, w.sa.comb }, &out);
     pre.* = out[1];
     return out[0];
+}
+
+/// The routed and shared experts and the hc expand a fused router's rows `f` end their block with: the new stream
+/// (`f.sf.pre` is the FFN's mix).
+fn fusedExperts(sc: *Scope, m: *Dsv41Model, ly: *const Layer, f: *const dkern.ffn_in.Out) !A {
+    return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
 }
 
 /// A tensor split's FFN at decode width, from the summed attention output `ao`: this rank's experts over the routes,
@@ -4885,6 +4947,24 @@ pub fn engramEarly(m: *const Dsv41Model, st: *const State, t1: u32) void {
     hs.rows(st.hist.items, &comp, out[0 .. hs.n_layers * nc]);
     for (m.engrams, 0..) |*e, k| e.table.readEarly(k, out[k * nc ..][0..nc]);
 }
+/// The Engram rows of a verify of `ids` at `st.n` (`[t1, drafts…]`: every draft of the block, before the round
+/// has chosen its rows) read now on GCD workers into the plugin's Engram LRU, a table each: the verify's first Engram
+/// layer finds them there, where the read would begin only once the verify is built. The history is not touched.
+fn engramAhead(m: *const Dsv41Model, st: *const State, ids: []const u32) void {
+    if (m.pair != null or m.engrams.len == 0 or ids.len > VERIFY_MAX_DRAFTS + 1) return;
+    const hs = &(m.hash orelse return);
+    const nc = hs.cols();
+    var comp: [VERIFY_MAX_DRAFTS + 1]u32 = undefined;
+    for (ids, comp[0..ids.len]) |t, *o| o.* = m.compressedId(t, false);
+    var all: [(VERIFY_MAX_DRAFTS + 1) * engram.MAX_LAYERS * engram.MAX_COLS]u32 = undefined;
+    hs.rows(st.hist.items, comp[0..ids.len], all[0 .. ids.len * hs.n_layers * nc]);
+    var mine: [(VERIFY_MAX_DRAFTS + 1) * engram.MAX_COLS]u32 = undefined;
+    for (m.engrams, 0..) |*e, k| {
+        for (0..ids.len) |t| @memcpy(mine[t * nc ..][0..nc], all[(t * hs.n_layers + k) * nc ..][0..nc]);
+        e.table.readEarly(k, mine[0 .. ids.len * nc]);
+    }
+}
+
 /// The Engram rows of `ids` (the chunk at `st.n - ids.len`, whose hash is `rows`) as a prefetch: the one the
 /// previous chunk started for it, or a new one; either way the prompt's next chunk is read behind. `m.ahead`
 /// keeps a prefetch that still has a chunk to hand over; the caller finishes the other.
@@ -4962,6 +5042,29 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     const p0 = st.n;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
+    // A draft launched ahead and not read by now is no round's; a verify's lead serves the rows it began with.
+    m.dropNextDraft();
+    var lead: ?Lead = m.lead;
+    m.lead = null;
+    defer if (lead) |*l| l.deinit();
+    if (lead) |*l| if (ids != .host or want != .all or vision != null or !chains(m) or !l.serves(m, st, ids.host)) {
+        l.deinit();
+        lead = null;
+    };
+    // The lead's rows this chunk takes, its routed experts handed over before anything else is built: the GPU has
+    // nothing behind the lead until they are.
+    var led: [2]A = .{ none, none };
+    defer for (led) |x| if (x.ctx != null) {
+        _ = mlx.mlx_array_free(x);
+    };
+    if (lead) |*l| {
+        var sc = Scope.init(gpa, m.s);
+        defer sc.deinit();
+        const x, const pre = try l.take(&sc, m, L);
+        if (l.routed) try asyncEvalAll(&.{ x, pre });
+        led = .{ sc.out(x), sc.out(pre) };
+        m.ds_led += 1;
+    }
     // a prompt chunk's Engram row ids hashed and their read thread started first, before the phase
     // change, the embedding and the spans' setup (a decode-sized chunk: after them, below). The thread copies the ids
     // and the tables it is handed, so nothing it reads depends on what follows.
@@ -5045,7 +5148,10 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     defer if (img_mask.ctx != null) {
         _ = mlx.mlx_array_free(img_mask);
     };
-    {
+    if (lead != null) {
+        hold(&sp.xs[0], led[0]);
+        hold(&sp.pres[0], led[1]);
+    } else {
         var sc = Scope.init(gpa, m.s);
         defer sc.deinit();
         const id_arr = switch (ids) {
@@ -5076,10 +5182,12 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     // The chunk's Engram rows come off the SSD on a thread while the layers before them run (a
     // decode token's once it is read back), and the prompt's next chunk is read behind them: the
     // previous call already did the same for this one (a prompt chunk's: started above).
-    if (!eng_early and eng_on and ids == .host) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span, images);
+    // A verify behind its lead reads its rows where the layer takes them (`spanIn`): they have been read since the
+    // draft was (`engramAhead`), and a prefetch's thread would only start now.
+    if (!eng_early and eng_on and ids == .host and lead == null) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span, images);
     sp.prefetch = prefetch;
 
-    var from: usize = 0;
+    var from: usize = if (lead) |l| l.hi else 0;
     if (ids == .gpu and m.engrams.len > 0) {
         var first = m.n_layers;
         for (m.engrams) |e| first = @min(first, e.layer);
@@ -6635,6 +6743,8 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
 pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, chunks: []const []const u32, verify: bool) !A {
     const c = &m.cfg;
     const N = chunks.len;
+    m.dropNextDraft();
+    m.dropLead();
     if (N == 0 or N > region_rows or states.len != N or gens.len != N or m.pair != null or m.streamed != null) return error.Dsv41BatchUnsupported;
     const offs = try gpa.alloc(usize, N + 1);
     defer gpa.free(offs);
@@ -6984,24 +7094,31 @@ fn batchedFused(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const S
 /// Each stage's window rows for committed positions [p0, p0 + n): the main
 /// stream `main_norm(main_proj(hidden))` through the stage's own kv path.
 fn commitMain(sc: *Scope, m: *Dsv41Model, st: *State, mh: A, p0: usize) !void {
-    const ds = &(m.dspark orelse return);
+    if (m.dspark == null) return;
     const n = dim(mh, 0);
     if (st.mh.ctx != null) _ = mlx.mlx_array_free(st.mh);
     st.mh = sc.out(try sc.slice(mh, 0, n - 1, n));
-    const main_x = try sc.rms(try ds.main_proj.apply(sc, mh), ds.main_norm, m.cfg.rms_norm_eps);
-    for (st.ds, 0..) |*ring, si| {
-        const st_ly = &m.layers[m.n_layers + si];
-        const kv = try kvRow(sc, m, st_ly, m.rope_plain.fwd, try st_ly.wkv.apply(sc, main_x), try sc.i(ci(p0)));
-        try ring.write(kv, p0, sc.s);
-    }
+    const main_x = try mainX(sc, m, mh);
+    for (st.ds, 0..) |*ring, si| try ring.write(try mainKv(sc, m, main_x, si, p0), p0, sc.s);
 }
 
-/// A stage's attention heads for one state's draft rows at [p0, p0 + B) from their projections `rows` (made over every
-/// state's rows), inverse-roped for `attnOutRoped`: every row sees the stage's window of committed main rows and every
-/// draft row.
-fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, main_keys: A, p0: usize) !A {
+/// The main rows `mh` as the stages read them: `main_norm(main_proj(mh))`.
+fn mainX(sc: *Scope, m: *Dsv41Model, mh: A) !A {
+    const ds = &m.dspark.?;
+    return sc.rms(try ds.main_proj.apply(sc, mh), ds.main_norm, m.cfg.rms_norm_eps);
+}
+
+/// Stage `si`'s window rows of `main_x` (`mainX`) for the positions from `p0` on, through the stage's own kv path.
+fn mainKv(sc: *Scope, m: *Dsv41Model, main_x: A, si: usize, p0: usize) !A {
+    const st_ly = &m.layers[m.n_layers + si];
+    return kvRow(sc, m, st_ly, m.rope_plain.fwd, try st_ly.wkv.apply(sc, main_x), try sc.i(ci(p0)));
+}
+
+/// A stage's attention heads for one state's draft rows at `pos` on (an int32 scalar) from their projections `rows`
+/// (made over every state's rows), inverse-roped for `attnOutRoped`: every row sees the stage's window of committed
+/// main rows and every draft row.
+fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, main_keys: A, pos: A) !A {
     const hd = m.cfg.head_dim;
-    const pos = try sc.i(ci(p0));
     const pj = try ropeProj(sc, m, ly, m.rope_plain.fwd, rows, pos);
     const keys = try sc.astype(try sc.concat(&.{ main_keys, pj.kv }, 0), .float32);
     const qf = try sc.astype(pj.q, .float32);
@@ -7022,8 +7139,9 @@ pub const DsparkPhases = dsv4.DsparkPhases;
 /// bigram bias chained position by position on the GPU (greedy), and the
 /// confidence head's logit per position; it truncates the block only when a threshold is set.
 pub fn dsparkDraft(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) !DsparkDraft {
-    const t0 = monoUs();
-    defer m.ds_draft_ns = @intCast((monoUs() - t0) * 1000);
+    // `draftRows` moves the start back for a draft launched behind the last verify.
+    m.ds_draft_us = monoUs();
+    defer m.ds_draft_ns = @intCast(@max(monoUs() - m.ds_draft_us, 0) * 1000);
     return draftRows(m, gpa, st, t1, false);
 }
 
@@ -7092,33 +7210,258 @@ pub fn dsparkDraftCollect(m: *Dsv41Model, gpa: std.mem.Allocator, a: *DraftAhead
 }
 /// `keep_logits` also copies the Markov-biased rows to the host.
 fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_logits: bool) !DsparkDraft {
-    var sc = Scope.init(gpa, m.s);
-    defer sc.deinit();
+    m.dropDraftScope();
+    m.dropLead();
+    if (m.next_draft) |*a| if (!keep_logits and a.standsFor(m, st, t1)) {
+        // The draft has run since the verify before it ended. The verify after it starts on its rows before the
+        // host has read them (`leadVerify`): its layers that need nothing of the host's.
+        var sc = a.sc;
+        var ev = a.ev;
+        const want_conf = a.want_conf;
+        _ = mlx.mlx_array_free(a.kept);
+        _ = mlx.mlx_array_free(a.next);
+        m.next_draft = null;
+        errdefer sc.deinit();
+        m.ds_draft_us = m.ds_verdict_us;
+        m.ds_chained += 1;
+        try leadVerify(m, st, t1, ev[0]);
+        try evalAll(&ev);
+        const d = try draftRead(&sc, m, gpa, t1, &ev, want_conf, false);
+        m.draft_scope = sc;
+        // The lead runs for a fraction of a millisecond: the verify's Engram rows are read from here, not from
+        // where the round has chosen its rows and built the layer before them.
+        engramAhead(m, st, d.ids);
+        return d;
+    };
+    m.dropNextDraft();
+    // The graph's arrays outlive this call (`Dsv41Model.draft_scope`): the state's allocator holds their list.
+    var sc = Scope.init(st.gpa, m.s);
+    errdefer sc.deinit();
     const g = try draftGraph(&sc, m, st, t1, keep_logits);
     var ev = g.ev;
     try evalAll(&ev);
-    return draftRead(&sc, m, gpa, t1, &ev, g.want_conf, keep_logits);
+    const d = try draftRead(&sc, m, gpa, t1, &ev, g.want_conf, keep_logits);
+    m.draft_scope = sc;
+    return d;
 }
+
+/// Most DSpark stages a draft's inputs are held for (`DraftFrom.keys`).
+const max_stages = 8;
+
+/// What a draft starts from: the token (`[1]` int32; `host` the same token where the host knows it), each stage's
+/// window of committed main rows, and the block's first position (an int32 scalar). The state's own (`draftFrom`),
+/// or what a verdict picks on the GPU before the host has read it (`dsparkDraftAhead`).
+const DraftFrom = struct {
+    t1: A,
+    host: ?u32 = null,
+    pos: A,
+    keys: [max_stages]A = undefined,
+};
+
+fn draftFrom(sc: *Scope, m: *const Dsv41Model, st: *const State, t1: u32) !DraftFrom {
+    if (st.ds.len > max_stages) return error.Dsv41TooManyStages;
+    var from: DraftFrom = .{ .t1 = try sc.ints(&.{@intCast(t1)}, &.{1}), .host = t1, .pos = try sc.i(ci(st.n)) };
+    for (0..st.ds.len) |si| from.keys[si] = (try stageWin(sc, m, st, si)).keys;
+    return from;
+}
+
+/// A draft handed to the GPU behind an open verify (`dsparkDraftAhead`), drawn from the token and the position that
+/// verify's verdict picks on the GPU: the stages start when the verify ends, not after the host has read its verdict.
+const Ahead = struct {
+    sc: Scope,
+    ev: [3]A,
+    want_conf: bool,
+    gen: u64,
+    /// The verdict it was drawn from: the drafts kept (an int32 scalar) and the token after them (`[1]` int32).
+    kept: A,
+    next: A,
+    /// Once the round has committed that same verdict (`dsparkFinish`): the position it drafts at; `t1` its token.
+    n: ?usize = null,
+    t1: u32 = 0,
+
+    fn deinit(self: *Ahead) void {
+        _ = mlx.mlx_array_free(self.kept);
+        _ = mlx.mlx_array_free(self.next);
+        self.sc.deinit();
+    }
+
+    /// Whether this is the draft `draftRows(m, _, st, t1, false)` would make now.
+    fn standsFor(self: *const Ahead, m: *const Dsv41Model, st: *const State, t1: u32) bool {
+        const n = self.n orelse return false;
+        return n == st.n and self.t1 == t1 and self.gen == m.state_gen and m.dec_state != null and st == &m.dec_state.?;
+    }
+};
+
+/// Whether a round's next draft and verify can go to the GPU behind the step before them: one unsplit model on its
+/// resident embedding and experts.
+fn chains(m: *const Dsv41Model) bool {
+    return m.chain and m.dspark != null and m.n_mtp > 0 and m.n_mtp <= max_stages and m.pair == null and m.tp == null and m.streamed == null and m.embed_tab == null and m.trace == null;
+}
+
+/// Whether the open verify of `st` can take the next round's draft behind it (`dsparkDraftAhead`): the engine
+/// expects that round to draft (`ds_chain`), and every stage's window is full whatever the verdict keeps.
+pub fn aheadFits(m: *const Dsv41Model, st: *const State) bool {
+    const v = &(st.verify orelse return false);
+    return m.ds_chain and chains(m) and v.mh.ctx != null and v.kv.len == 0 and v.n0 >= m.cfg.sliding_window and m.dec_state != null and st == &m.dec_state.?;
+}
+
+/// The next round's draft handed to the GPU behind the open verify of `st` (`aheadFits`), from that verify's
+/// verdict while it is still the GPU's: `kept` drafts stay (an int32 scalar) and `next` is the token after them
+/// (`[1]` int32). The stages run on whichever rows the verdict keeps; `dsparkFinish` checks the round committed the
+/// same verdict, and the next `dsparkDraft` reads it.
+pub fn dsparkDraftAhead(m: *Dsv41Model, st: *State, kept: A, next: A) !void {
+    m.dropNextDraft();
+    if (!aheadFits(m, st)) return;
+    const v = &st.verify.?;
+    const W: usize = m.cfg.sliding_window;
+    // The verdict is its own batch: a wait on it ends with the verify, not with the draft behind it.
+    try asyncEvalAll(&.{ kept, next });
+    var sc = Scope.init(st.gpa, m.s);
+    errdefer sc.deinit();
+    // The rows the verdict keeps, and the window that ends with them: row j of [the window before the chunk, the
+    // chunk's rows] is position n0 - W + j.
+    const rows = try sc.add(kept, try sc.i(1));
+    const idx = try sc.add(rows, try sc.arange(0, W));
+    var from: DraftFrom = .{ .t1 = next, .pos = try sc.add(rows, try sc.i(ci(v.n0))) };
+    const main_x = try mainX(&sc, m, v.mh);
+    const kv = try st.gpa.alloc(A, st.ds.len);
+    @memset(kv, none);
+    errdefer {
+        for (kv) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+        st.gpa.free(kv);
+    }
+    for (st.ds, kv, 0..) |*ring, *slot, si| {
+        const all = try sc.astype(try mainKv(&sc, m, main_x, si, v.n0), mlx.mlx_array_dtype(ring.buf));
+        slot.* = sc.out(all);
+        from.keys[si] = try sc.take(try sc.concat(&.{ try ring.read(&sc, v.n0 - W, v.n0), all }, 0), idx, 0);
+    }
+    const g = try draftGraphFrom(&sc, m, &from, false);
+    try asyncEvalAll(&g.ev);
+    v.kv = kv;
+    m.next_draft = .{ .sc = sc, .ev = g.ev, .want_conf = g.want_conf, .gen = m.state_gen, .kept = ref(kept), .next = ref(next) };
+    m.ds_launched += 1;
+}
+
+/// Whether a draft launched behind the last verify has not been read: a step that is not its round runs behind it.
+pub fn draftInFlight(m: *const Dsv41Model) bool {
+    return m.next_draft != null;
+}
+
+/// The next verify's layers before its first Engram layer (`leadLayers`), handed to the GPU behind the draft whose
+/// tokens are its rows: `t1` and every draft of the block at `st.n` on, the drafts (`toks`, `[B]` int32) still the
+/// GPU's. `extendIds` takes the rows the round then verifies; these layers keep a window alone, which a narrower
+/// verify rolls back by position.
+const Lead = struct {
+    /// The stream and the FFN's mix after layer `hi - 1`; or, `routed`, that layer stopped before its routed experts
+    /// (`blockFusedTo`) and these are what they take, row by row: the experts read their weights a row's routes at
+    /// a time, so they run over the rows the round verifies, not over every row the lead began with.
+    rows_at: [7]A = @splat(none),
+    routed: bool = false,
+    toks: A,
+    rows: usize,
+    hi: usize,
+    p0: usize,
+    gen: u64,
+    t1: u32,
+
+    fn deinit(self: *Lead) void {
+        for (self.rows_at) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+        _ = mlx.mlx_array_free(self.toks);
+    }
+
+    /// The stream and the mix its first `L` rows enter layer `hi` with.
+    fn take(self: *const Lead, sc: *Scope, m: *Dsv41Model, L: usize) ![2]A {
+        var r: [7]A = undefined;
+        for (&r, self.rows_at) |*o, x| o.* = if (x.ctx != null) try sc.slice(x, 0, 0, L) else none;
+        if (!self.routed) return .{ r[0], r[1] };
+        const f: dkern.ffn_in.Out = .{ .x1 = r[0], .h2 = r[1], .sf = .{ .pre = r[2], .post = r[3], .comb = r[4] }, .idx = r[5], .wts = r[6] };
+        return .{ try fusedExperts(sc, m, &m.layers[self.hi - 1], &f), f.sf.pre };
+    }
+
+    /// Whether `ids` at `st.n` are this lead's first rows.
+    fn serves(self: *const Lead, m: *const Dsv41Model, st: *const State, ids: []const u32) bool {
+        if (ids.len == 0 or ids.len > self.rows or self.p0 != st.n or self.gen != m.state_gen or m.dec_state == null or st != &m.dec_state.? or ids[0] != self.t1) return false;
+        const toks = mlx.mlx_array_data_int32(self.toks) orelse return false;
+        for (ids[1..], toks[0 .. ids.len - 1]) |a, b| if (@as(i64, a) != @as(i64, b)) return false;
+        return true;
+    }
+};
+
+/// The layers a verify can run before the host has its tokens: those before the first Engram write, compressor or
+/// DSpark target, whose only state is their window.
+fn leadLayers(m: *const Dsv41Model) usize {
+    var hi: usize = 0;
+    while (hi < m.n_layers and m.ratio(hi) == 0 and m.dsparkTarget(hi) == null) : (hi += 1) {
+        for (m.engrams) |e| if (e.layer == hi) return hi;
+    }
+    return hi;
+}
+
+fn leadVerify(m: *Dsv41Model, st: *State, t1: u32, toks: A) !void {
+    const hi = leadLayers(m);
+    const rows = dim(toks, 0) + 1;
+    if (hi == 0 or !chains(m) or rows > dkern.max_rows or rows > VERIFY_MAX_DRAFTS + 1 or st.verify != null) return;
+    const c = &m.cfg;
+    var sc = Scope.init(st.gpa, m.s);
+    defer sc.deinit();
+    const id_arr = try sc.concat(&.{ try sc.ints(&.{@intCast(t1)}, &.{1}), toks }, 0);
+    var x = try sc.broadcast(try sc.expand(try m.embed.rows(&sc, id_arr, m.act), 1), &.{ ci(rows), ci(c.dsv4_hc_mult), ci(c.hidden_size) });
+    var pre = try onehotPre(&sc, m, rows);
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(st.gpa);
+    var routes: ?dkern.ffn_in.Out = null;
+    for (0..hi) |li| {
+        var sh: Shared = .{};
+        // The last layer stops before its routed experts where the fused launches serve it (`block`'s own test).
+        const fused = li + 1 == hi and li < m.regions.len and compiledAt(m, rows);
+        x = (if (fused) try blockFusedTo(&sc, m, st, li, x, &pre, st.n, &sh, &routes) else null) orelse try block(&sc, m, st, li, x, &pre, st.n, &sh);
+        if (sh.topk.ctx != null or sh.cand.ctx != null) return error.Dsv41LeadLayer;
+        try appendLayerState(st.gpa, &ev, &st.layers[li]);
+    }
+    var lead: Lead = .{ .routed = routes != null, .toks = ref(toks), .rows = rows, .hi = hi, .p0 = st.n, .gen = m.state_gen, .t1 = t1 };
+    errdefer lead.deinit();
+    const held: []const A = if (routes) |f| &.{ f.x1, f.h2, f.sf.pre, f.sf.post, f.sf.comb, f.idx, f.wts } else &.{ x, pre };
+    for (held, lead.rows_at[0..held.len]) |a, *slot| slot.* = sc.out(a);
+    try ev.appendSlice(st.gpa, held);
+    try asyncEvalAll(ev.items);
+    m.lead = lead;
+}
+
 /// `draftRows`' graph (its arrays `sc`'s): the ids, the confidences (the ids again without them) and the rows `keep_logits`
 /// reads (the ids again otherwise).
 const DraftGraph = struct { ev: [3]A, want_conf: bool };
 fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool) !DraftGraph {
+    const from = try draftFrom(sc, m, st, t1);
+    return draftGraphFrom(sc, m, &from, keep_logits);
+}
+fn draftGraphFrom(sc: *Scope, m: *Dsv41Model, from: *const DraftFrom, keep_logits: bool) !DraftGraph {
     const c = &m.cfg;
     const B = m.ds_block;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
     const ds = &m.dspark.?;
-    var ids: [16]i32 = undefined;
-    for (0..B) |k| ids[k] = @intCast(if (k == 0) t1 else c.dsv4_dspark_noise_token_id);
-    var uids: [16]u32 = undefined;
-    for (uids[0..B], ids[0..B]) |*u, v| u.* = @intCast(v);
-    const emb = try embedIds(m, sc, uids[0..B], m.act);
+    var noise: [16]i32 = undefined;
+    @memset(noise[0 .. B - 1], @intCast(c.dsv4_dspark_noise_token_id));
+    const emb = if (from.host) |t1| blk: {
+        var uids: [16]u32 = undefined;
+        for (uids[0..B], 0..) |*u, k| u.* = if (k == 0) t1 else c.dsv4_dspark_noise_token_id;
+        break :blk try embedIds(m, sc, uids[0..B], m.act);
+    } else try m.embed.rows(sc, if (B == 1) from.t1 else try sc.concat(&.{ from.t1, try sc.ints(noise[0 .. B - 1], &.{ci(B - 1)}) }, 0), m.act);
     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(d) });
     var pre = try onehotPre(sc, m, B);
-    for (0..m.n_mtp) |si| x = try stageBlock(sc, m, &.{st}, m.n_layers + si, x, &pre, B);
+    for (0..m.n_mtp) |si| {
+        x = try stageBlock(sc, m, &.{.{ .keys = from.keys[si], .pos = from.pos }}, m.n_layers + si, x, &pre, B);
+        // A stage is handed over as it is built, as a decode step's layers are (`runLayers`): the GPU runs it under
+        // the later stages' graphs instead of waiting for the whole draft's.
+        if (si + 1 < m.n_mtp) try asyncEvalAll(&.{ x, pre });
+    }
     const hout = try hcCollapse(sc, x, pre);
     const logits = try sc.astype(try m.draftHead().apply(sc, try sc.rms(hout, ds.norm, c.rms_norm_eps)), .float32);
-    var cur = try sc.ints(ids[0..1], &.{1});
+    var cur = from.t1;
     const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
     // The fused chain (`markov.chain`: the op chain's bytes in B + 1 launches), null for a draft it does not take (the op
     // chain below).
@@ -7186,6 +7529,9 @@ fn draftRead(sc: *Scope, m: *const Dsv41Model, gpa: std.mem.Allocator, t1: u32, 
 /// stages run once over every state's block, attention per state against its own window of committed main rows, and
 /// the Markov chain steps every state's row at once. `keep_logits` also copies the Markov-biased rows to the host.
 pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, t1s: []const u32, keep_logits: bool, out: []DsparkDraft) !void {
+    if (states.len > region_rows) return error.Dsv41BatchUnsupported;
+    m.dropNextDraft();
+    m.dropLead();
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
     const c = &m.cfg;
@@ -7206,7 +7552,13 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
     const emb = try embedIds(m, &sc, uids, m.act);
     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(N * B), ci(hc), ci(d) });
     var pre = try onehotPre(&sc, m, N * B);
-    for (0..m.n_mtp) |si| x = try stageBlock(&sc, m, states, m.n_layers + si, x, &pre, B);
+    var wins: [region_rows]StageWin = undefined;
+    for (0..m.n_mtp) |si| {
+        for (states, wins[0..N]) |st, *w| w.* = try stageWin(&sc, m, st, si);
+        x = try stageBlock(&sc, m, wins[0..N], m.n_layers + si, x, &pre, B);
+        // handed over as built (`draftGraph`).
+        if (si + 1 < m.n_mtp) try asyncEvalAll(&.{ x, pre });
+    }
     const flat = try hcCollapse(&sc, x, pre);
     const hout = try sc.reshape(flat, &.{ ci(N), ci(B), ci(d) });
     const logits = try sc.reshape(try sc.astype(try m.draftHead().apply(&sc, try sc.rms(flat, ds.norm, c.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
@@ -7261,22 +7613,28 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
     }
 }
 
-/// A DSpark stage over `B` draft rows a state: the mixes, norms and FFN over every row, each state's attention
-/// against its own window of committed main rows.
-fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: A, pre: *A, B: usize) !A {
+/// A state's side of one DSpark stage: its window of committed main rows and its block's first position (an int32
+/// scalar). The state's own (`stageWin`), or picked on the GPU by a verdict the host has not read (`dsparkDraftAhead`).
+const StageWin = struct { keys: A, pos: A };
+
+fn stageWin(sc: *Scope, m: *const Dsv41Model, st: *const State, si: usize) !StageWin {
+    const window = @min(m.cfg.sliding_window, st.n);
+    return .{ .keys = try st.ds[si].read(sc, st.n - window, st.n), .pos = try sc.i(ci(st.n)) };
+}
+
+/// A DSpark stage over `B` draft rows a state (`wins`, one a state): the mixes, norms and FFN over every row, each
+/// state's attention against its own window of committed main rows.
+fn stageBlock(sc: *Scope, m: *Dsv41Model, wins: []const StageWin, li: usize, x: A, pre: *A, B: usize) !A {
     const ly = &m.layers[li];
-    const si = li - m.n_layers;
     const pa = try hcPreNorm(sc, m, x, pre.*, &ly.hc_attn, ly.attn_norm);
     // The projections read their weights once for every state's rows; the rope and the attention are each state's.
     const rows = try qkvRows(sc, m, ly, pa.h);
     var heads: [region_rows]A = undefined;
-    for (states, heads[0..states.len], 0..) |st, *o, k| {
-        const window = @min(m.cfg.sliding_window, st.n);
-        const keys = try st.ds[si].read(sc, st.n - window, st.n);
-        const mine: Proj = if (states.len == 1) rows else .{ .q = try sc.slice(rows.q, 0, k * B, (k + 1) * B), .kv = try sc.slice(rows.kv, 0, k * B, (k + 1) * B), .qr = rows.qr };
-        o.* = try dsparkHeads(sc, m, ly, mine, keys, st.n);
+    for (wins, heads[0..wins.len], 0..) |w, *o, k| {
+        const mine: Proj = if (wins.len == 1) rows else .{ .q = try sc.slice(rows.q, 0, k * B, (k + 1) * B), .kv = try sc.slice(rows.kv, 0, k * B, (k + 1) * B), .qr = rows.qr };
+        o.* = try dsparkHeads(sc, m, ly, mine, w.keys, w.pos);
     }
-    const h = try attnOutRoped(sc, m, ly, if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0));
+    const h = try attnOutRoped(sc, m, ly, if (wins.len == 1) heads[0] else try sc.concat(heads[0..wins.len], 0));
     const pf = try hcExpandPreNorm(sc, m, x, h, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
     const y = try moe(sc, m, li, pf.h, none);
     pre.* = pf.sp.pre;
@@ -7350,6 +7708,8 @@ pub fn dsparkBeginWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u
         st.dropVerify();
         return e;
     };
+    // The verify is with the GPU: the draft's arrays go under it.
+    m.dropDraftScope();
     return .{ .vl_g = vl, .b = b, .verify = ids, .verify_at = t0 };
 }
 
@@ -7402,7 +7762,20 @@ fn rollbackVerify(m: *Dsv41Model, st: *State, keep_n: usize) !void {
 pub fn dsparkFinish(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending: *DsparkPending, accepted: usize, next_token: u32) !DsparkRound {
     const keep_n = accepted + 1;
     const t0 = monoUs();
+    m.ds_verdict_us = t0;
     try finishVerify(m, gpa, st, keep_n);
+    // A draft launched behind this verify stands for the verdict the GPU picked: the round's must be the same one.
+    if (m.next_draft) |*a| {
+        var k: i32 = -1;
+        var t: i32 = -1;
+        const same = a.gen == m.state_gen and mlx.mlx_array_item_int32(&k, a.kept) == 0 and mlx.mlx_array_item_int32(&t, a.next) == 0 and k == accepted and t == next_token;
+        if (same) {
+            a.n = st.n;
+            a.t1 = next_token;
+            // The next verify's first row is known from here: its Engram rows are read under the draft.
+            engramEarly(m, st, next_token);
+        } else m.dropNextDraft();
+    }
     const t1 = monoUs();
     const tokens = try gpa.alloc(u32, keep_n);
     @memcpy(tokens, pending.verify[0..keep_n]);
@@ -7424,7 +7797,11 @@ pub fn finishVerify(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, keep_n: 
     defer st.dropVerify();
     const v = &st.verify.?;
     if (v.n0 + keep_n < st.n) try rollbackVerify(m, st, keep_n);
-    if (v.mh.ctx != null) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep_n), v.n0);
+    if (v.mh.ctx == null) return;
+    if (v.kv.len == 0) return commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep_n), v.n0);
+    // A draft launched behind this verify read these rows: the windows keep the same ones.
+    hold(&st.mh, try sc.slice(v.mh, 0, keep_n - 1, keep_n));
+    for (st.ds, v.kv) |*ring, kv| try ring.write(try sc.slice(kv, 0, 0, keep_n), v.n0, sc.s);
 }
 
 pub fn dsparkObserve(m: *Dsv41Model, ph: DsparkPhases) void {
@@ -7442,6 +7819,23 @@ pub fn dsparkRound(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, 
     return dsparkRoundWith(m, gpa, st, t1, &d, accepted_cap);
 }
 
+/// A greedy verdict as arrays: of the verify rows' own tokens `am` (`[b + 1]` int32), how many of `drafts` the
+/// trunk agrees with from the first on, at most `cap` (an int32 scalar), and the trunk's token after them (`[1]`).
+pub const LazyVerdict = struct { kept: A, next: A };
+fn greedyVerdict(sc: *Scope, am: A, drafts: []const u32, cap: usize) !LazyVerdict {
+    const b = drafts.len;
+    var kept = try sc.i(0);
+    if (b > 0) {
+        const hit = try sc.astype(try sc.op2(mlx.mlx_equal, try sc.slice(am, 0, 0, b), try sc.ints(@ptrCast(drafts), &.{ci(b)})), .int32);
+        var o = mlx.mlx_array_new();
+        const hits = try sc.res(mlx.mlx_cumsum(&o, hit, 0, false, true, sc.s), &o);
+        // A draft stays while every draft up to it hit.
+        const stays = try sc.astype(try sc.op2(mlx.mlx_equal, hits, try sc.arange(1, b + 1)), .int32);
+        kept = try sc.op2(mlx.mlx_minimum, try sc.sum(stays, 0, false), try sc.i(@intCast(@min(cap, b))));
+    }
+    return .{ .kept = kept, .next = try sc.reshape(try sc.take(am, kept, 0), &.{1}) };
+}
+
 /// `dsparkRound` over a given draft (a copied continuation).
 pub fn dsparkRoundWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, d: *const DsparkDraft, accepted_cap: usize) !DsparkRound {
     var pending = try dsparkBeginWith(m, gpa, st, t1, d);
@@ -7452,12 +7846,29 @@ pub fn dsparkRoundWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u
     var am32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(am32);
     try mlx.check(mlx.mlx_astype(&am32, am, .int32, m.s));
-    try mlx.check(mlx.mlx_array_eval(am32));
-    const best = mlx.mlx_array_data_int32(am32) orelse return error.NoData;
     var accepted: usize = 0;
-    while (accepted < pending.b and @as(u32, @intCast(best[accepted])) == d.ids[accepted + 1]) accepted += 1;
-    accepted = @min(accepted, accepted_cap);
-    var r = try dsparkFinish(m, gpa, st, &pending, accepted, @intCast(best[accepted]));
+    var next: u32 = undefined;
+    if (aheadFits(m, st)) {
+        // The verdict picked on the GPU, the next round's draft behind it: the stages start as the verify ends.
+        var sc = Scope.init(gpa, m.s);
+        defer sc.deinit();
+        const v = try greedyVerdict(&sc, am32, d.ids[1 .. pending.b + 1], accepted_cap);
+        try dsparkDraftAhead(m, st, v.kept, v.next);
+        try evalAll(&.{ v.kept, v.next });
+        var k: i32 = 0;
+        var t: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&k, v.kept));
+        try mlx.check(mlx.mlx_array_item_int32(&t, v.next));
+        accepted = @intCast(k);
+        next = @intCast(t);
+    } else {
+        try mlx.check(mlx.mlx_array_eval(am32));
+        const best = mlx.mlx_array_data_int32(am32) orelse return error.NoData;
+        while (accepted < pending.b and @as(u32, @intCast(best[accepted])) == d.ids[accepted + 1]) accepted += 1;
+        accepted = @min(accepted, accepted_cap);
+        next = @intCast(best[accepted]);
+    }
+    var r = try dsparkFinish(m, gpa, st, &pending, accepted, next);
     r.phases.draft_ns = m.ds_draft_ns;
     dsparkObserve(m, r.phases);
     return r;
@@ -7781,6 +8192,72 @@ test "dsv41 decode: a token still on the GPU decodes as its host id does, Engram
         for (a, b) |x, y| try testing.expectEqual(@as(u32, @bitCast(x)), @as(u32, @bitCast(y)));
     }
     try testing.expectEqualSlices(u32, host_st.hist.items, gpu_st.hist.items);
+}
+
+test "dsv41 lead: a layer stopped before its routed experts at six rows, then finished over its first rows, is the layer over those rows" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const dfix = @import("decode/fixture.zig");
+    const gpa = testing.allocator;
+    const opts: dfix.Opts = .{ .lo = 0, .hi = 1, .experts = 16, .ctx = 8, .fused = true, .experts_fp4 = true };
+    for ([_]usize{ 6, 3, 1 }) |L| {
+        // Two models of the same draws: one runs the layer over L rows, the other leads with six.
+        const whole = try dfix.Fixture.init(gpa, opts);
+        defer whole.deinit();
+        const led = try dfix.Fixture.init(gpa, opts);
+        defer led.deinit();
+        const x = try whole.stream(6);
+        defer _ = mlx.mlx_array_free(x);
+        const cpre = try whole.cpre(6);
+        defer _ = mlx.mlx_array_free(cpre);
+        var sc = Scope.init(gpa, whole.m.s);
+        defer sc.deinit();
+        var pre_w = try sc.slice(cpre, 0, 0, L);
+        var sh_w: Shared = .{};
+        const y_w = try block(&sc, whole.m, whole.state(), 0, try sc.slice(x, 0, 0, L), &pre_w, 8, &sh_w);
+
+        var pre_l = cpre;
+        var sh_l: Shared = .{};
+        var routes: ?dkern.ffn_in.Out = null;
+        _ = (try blockFusedTo(&sc, led.m, led.state(), 0, x, &pre_l, 8, &sh_l, &routes)) orelse return error.TestUnexpectedResult;
+        const f = routes orelse return error.TestUnexpectedResult; // the fixture's router runs on the fused launches
+        try testing.expect(pre_l.ctx == cpre.ctx);
+        var lead: Lead = .{ .routed = true, .toks = mlx.mlx_array_new(), .rows = 6, .hi = 1, .p0 = 8, .gen = 0, .t1 = 0 };
+        defer lead.deinit();
+        for ([_]A{ f.x1, f.h2, f.sf.pre, f.sf.post, f.sf.comb, f.idx, f.wts }, &lead.rows_at) |a, *slot| slot.* = sc.out(a);
+        const got = try lead.take(&sc, led.m, L);
+
+        const want_y = try hostF32(y_w);
+        defer gpa.free(want_y);
+        const got_y = try hostF32(got[0]);
+        defer gpa.free(got_y);
+        const want_pre = try hostF32(pre_w);
+        defer gpa.free(want_pre);
+        const got_pre = try hostF32(got[1]);
+        defer gpa.free(got_pre);
+        try testing.expectEqual(want_y.len, got_y.len);
+        try testing.expectEqual(want_pre.len, got_pre.len);
+        if (L == 6) {
+            // The same launches over the same rows: the same bits.
+            try testing.expectEqualSlices(f32, want_y, got_y);
+            try testing.expectEqualSlices(f32, want_pre, got_pre);
+        } else {
+            // Launches of another row count round apart; a wrong row would be far off.
+            try testing.expect(dkern.relRms(got_y, want_y) < 2e-2);
+            try testing.expect(dkern.relRms(got_pre, want_pre) < 2e-2);
+        }
+        // The window keeps the rows either way.
+        const ww = try hostF32(try whole.state().layers[0].win.read(&sc, 8, 8 + L));
+        defer gpa.free(ww);
+        const wl = try hostF32(try led.state().layers[0].win.read(&sc, 8, 8 + L));
+        defer gpa.free(wl);
+        try testing.expect(dkern.relRms(wl, ww) < 2e-2);
+        if (L == 6) continue;
+        // Row 1 of the lead is not row 0 of the layer: the bar above tells rows apart.
+        const row = want_y.len / L;
+        const lead_all = try hostF32(try fusedExperts(&sc, led.m, &led.m.layers[0], &f));
+        defer gpa.free(lead_all);
+        try testing.expect(dkern.relRms(lead_all[row .. 2 * row], want_y[0..row]) > 0.5);
+    }
 }
 
 test "dsv41 fixture: DSpark rounds emit serial greedy; rollback and full accept leave serial state (DSV41_TINY)" {

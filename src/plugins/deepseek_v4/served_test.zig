@@ -1010,6 +1010,10 @@ fn expectDspark(comptime P: type, files: []const sdk.fixture.File, sampling: Sam
     const io = std.Io.Threaded.global_single_threaded.io();
     const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
     defer ds.restore();
+    // The tapes are rounds the host read one step at a time: which rounds draft follows the times it measured.
+    // Rounds chained on the GPU are held to those in `chained rounds emit the tokens`.
+    const chain = env.override(.MLX_SERVE_DSV41_CHAIN, "0");
+    defer chain.restore();
     const p = try Served.open(&P.table, files, tape);
     defer p.close();
     var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
@@ -1058,6 +1062,55 @@ test "deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal th
     const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
     try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-greedy.tape"));
     try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0.8, .top_p = 0.95, .seed = 4 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-sampled.tape"));
+}
+
+/// The tokens of 20 DSpark rounds that verify the whole block, chained on the GPU or not, and the rounds that ran
+/// chained.
+fn chainTokens(files: []const sdk.fixture.File, sampling: SamplingParams, chain: [*:0]const u8, out: *std.ArrayList(u32)) !u64 {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
+    defer ds.restore();
+    const ch = env.override(.MLX_SERVE_DSV41_CHAIN, chain);
+    defer ch.restore();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
+    defer p.close();
+    var tok: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 30, 31 };
+    var gen = try Generator.initWithOptions(io, a, &p.xfm, &tok, &prompt, 96, sampling, &.{}, .{
+        .pld_enabled = true,
+        .mtp_enabled = true,
+        .skip_lazy_preforward = true,
+        .lookup_prompt = &prompt,
+    });
+    defer gen.deinit(a);
+    try testing.expect(gen.dspark_enabled);
+    // Every round drafts and verifies its block, whatever the times it measures say.
+    gen.dspark_pol.?.pin_rows = 4;
+    for (0..20) |_| {
+        const r = (try gen.nextDspark(a)) orelse break;
+        defer a.free(r.tokens);
+        try out.appendSlice(a, r.tokens);
+    }
+    try out.append(a, gen.next_token_id);
+    return gen.dspark_chained;
+}
+
+test "deepseek_v41 served: chained rounds emit the tokens the host-read rounds emit, greedy and seeded" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
+    for ([_]SamplingParams{ .{ .temperature = 0 }, .{ .temperature = 0.8, .top_p = 0.95, .seed = 4 } }) |sampling| {
+        var plain: std.ArrayList(u32) = .empty;
+        defer plain.deinit(testing.allocator);
+        var chained: std.ArrayList(u32) = .empty;
+        defer chained.deinit(testing.allocator);
+        try testing.expectEqual(@as(u64, 0), try chainTokens(files, sampling, "0", &plain));
+        try testing.expect(try chainTokens(files, sampling, "1", &chained) >= 15);
+        try testing.expect(plain.items.len > 20);
+        try testing.expectEqualSlices(u32, plain.items, chained.items);
+    }
 }
 
 test "deepseek_v41 served: a pack that quantized its DSpark heads drafts from them dequantized" {

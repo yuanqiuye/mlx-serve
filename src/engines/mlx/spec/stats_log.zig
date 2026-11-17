@@ -58,8 +58,8 @@ pub fn logSpecStats(self: *const Generator) void {
         const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
             @as(f64, @floatFromInt(self.dspark_attempted));
         log.info(
-            "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2} stage_rounds={d} copy_rounds={d} copy_drafted={d} copy_accepted={d} group_rounds={d}\n",
-            .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, self.dspark_attempted - self.dspark_copies, self.dspark_copies, self.dspark_copy_drafted, self.dspark_copy_accepted, self.dspark_group_rounds },
+            "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2} stage_rounds={d} copy_rounds={d} copy_drafted={d} copy_accepted={d} group_rounds={d} chained={d} led={d}\n",
+            .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, self.dspark_attempted - self.dspark_copies, self.dspark_copies, self.dspark_copy_drafted, self.dspark_copy_accepted, self.dspark_group_rounds, self.dspark_chained, self.dspark_led },
         );
         if (self.dspark_pol) |pol| log.info(
             "  [spec-stats] dspark policy: plain_ticks={d} skipped={d} probes={d} plain_ms={d:.2} acc_pos={s} rows_hist={s}\n",

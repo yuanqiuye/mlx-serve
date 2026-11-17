@@ -338,6 +338,81 @@ test "deepseek_v41 aux: a snapshot sliced short of its end restores there by rep
     }
 }
 
+/// Greedy DSpark rounds from `prompt` on a fresh twin: every round's draft, the rows it verifies (`lens`, in turn),
+/// what it keeps and the token after; round `foreign` verifies a draft of its own making, not the stages'.
+const ChainRun = struct {
+    drafts: [12][4]u32 = undefined,
+    conf: [12][3]f32 = undefined,
+    kept: [12]u32 = undefined,
+    next: [12]u32 = undefined,
+    chained: u64 = 0,
+    led: u64 = 0,
+
+    fn of(files: []const sdk.fixture.File, prompt: []const u32, chain: bool) !ChainRun {
+        const gpa = testing.allocator;
+        const t = try Twin.open(files, "");
+        defer t.close();
+        const model: *v41.Model = @ptrCast(@alignCast(t.m));
+        const m = model.mdl;
+        m.chain = chain;
+        m.ds_want_conf = true;
+        const first = try slotForward(t, .prefill, &.{1}, prompt, &.{0});
+        defer gpa.free(first);
+        var tok: u32 = 0;
+        for (first, 0..) |v, i| if (v > first[tok]) {
+            tok = @intCast(i);
+        };
+        const st = &m.dec_state.?;
+        const lens = [_]usize{ 3, 3, 1, 3, 0, 2, 3, 3, 3, 1, 3, 3 };
+        const foreign = 7;
+        var run: ChainRun = .{};
+        for (lens, 0..) |len, k| {
+            var d = try dsv41.dsparkDraft(m, gpa, st, tok);
+            defer d.deinit(gpa);
+            try testing.expectEqual(@as(usize, 3), d.len);
+            @memcpy(&run.drafts[k], d.ids[0..4]);
+            @memcpy(&run.conf[k], d.confidence[0..3]);
+            d.len = len;
+            // The round after a foreign draft's is not expected to draft: nothing is launched behind this one.
+            m.ds_chain = k != foreign;
+            if (k == foreign) for (d.ids[1..]) |*x| {
+                x.* = (x.* + 17) % 90;
+            };
+            var r = try dsv41.dsparkRoundWith(m, gpa, st, tok, &d, 99);
+            defer r.deinit(gpa);
+            run.kept[k] = r.accepted;
+            run.next[k] = r.next_token;
+            tok = r.next_token;
+        }
+        run.chained = m.ds_chained;
+        run.led = m.ds_led;
+        return run;
+    }
+};
+
+test "deepseek_v41 DSpark: a draft launched behind its verify and a verify begun behind its draft are the ones the host builds after reading each" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
+    var prompt: [21]u32 = undefined;
+    for (&prompt, 0..) |*x, i| x.* = @intCast(3 + (i * 37 + i * i) % 90);
+    const plain = try ChainRun.of(files, &prompt, false);
+    const chain = try ChainRun.of(files, &prompt, true);
+    try testing.expectEqual(@as(u64, 0), plain.chained + plain.led);
+    // Every round but the first and the one after the foreign draft reads a launched draft; every one of those but
+    // the foreign round itself verifies rows its lead began with.
+    try testing.expectEqual(@as(u64, 10), chain.chained);
+    try testing.expectEqual(@as(u64, 9), chain.led);
+    try testing.expectEqualSlices(u32, &plain.kept, &chain.kept);
+    try testing.expectEqualSlices(u32, &plain.next, &chain.next);
+    for (plain.drafts, chain.drafts) |a, b| try testing.expectEqualSlices(u32, &a, &b);
+    for (plain.conf, chain.conf) |a, b| for (a, b) |x, y| try testing.expectApproxEqAbs(x, y, 1e-3 * @max(1, @abs(x)));
+    var partial: usize = 0;
+    for (plain.kept) |k| partial += @intFromBool(k < 3);
+    try testing.expect(partial > 0); // a launched draft follows verdicts that keep only some of the rows
+}
+
 test "deepseek_v41 CED: a lead chunk that skips the decoder leaves what the chunk after it reads" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

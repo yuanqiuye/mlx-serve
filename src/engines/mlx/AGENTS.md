@@ -207,6 +207,7 @@ Kernels + numerics:
   (`preflight.streamRefused`): a plugin that ignored the setting held every expert beside a bill of slot rows. A stream
   opens on a GPU stream only (`StreamedNeedsGpuStream`): on a CPU stream its reads land after the forward reads the rows.
 - **Affine-4 banks at ONE decode token take `moe_affine4`**; a one-expert bank VIEW is what the kernels bind, because MLX bills a command buffer per bound array's `data_size`.
+- **A command buffer queued behind work it does not read runs BESIDE it, never after it**: a keep-busy filler left the GPU's idle as it was and each round longer. Work that reads a result starts as that result lands and the host still hears of it 50 us later: close a host round trip by building the next step on the result (DSpark's `dsparkDraftAhead`).
 - **MLX's concurrent encoder puts a GLOBAL barrier before any kernel that reads an outstanding write**: parallel branches overlap one stage only, and ordering the q projection behind the indexer with `mlx_depends` made the layer slower; judge a chained kernel by its stage, not its alone-time.
 - **The indexer score stays on the NAX matrix kernel at every width** (`msv_qsa_score`): no scalar accumulation order reproduces it, and decode, verify and prefill must pick the same blocks.
 - **A fused kernel gated on ONE model's shape leaves the others on the composed chain**: gate on the kernel's arithmetic, test each served shape; re-sweep planners after an mlx bump.

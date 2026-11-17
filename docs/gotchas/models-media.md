@@ -873,3 +873,21 @@ rows copied, rows by pread, questions to the kernel and stale answers.
 Guard: `engram_direct map: under suspicion a row is copied only out of pages copied from before` and `the kernel's
 answer decides what is held`.
 
+### A DSpark round left the GPU idle twice, and a filler did not fill it
+Defect: DeepSeek-V4.1 decode kept an M5 Ultra's GPU busy 96% of the time (Metal System Trace: 96.3% greedy, 95.8%
+sampled). Each round idled about 0.4 ms after its verify, while the host read the verdict and built the draft, and
+again after its draft, while the host read the tokens, chose its rows, read their Engram rows and built the first layer.
+Cause: every step waited for the host to read the one before it. A filler queued behind each result left the idle as
+it was and made a round 0.9% longer: a command buffer that reads nothing of the work in flight runs beside it (two
+buffers of 7.5 ms took 13 and 16 ms together), where one that reads its result starts a microsecond after it ends,
+and the host still hears of the first 50 us later.
+Fix: the verdict is picked on the GPU and the next draft built on it before the host reads it (`dsparkDraftAhead`:
+the stages' windows a gather at the kept row). The next verify's first layer runs behind that draft on every row of
+the block (`leadVerify`), up to its routed experts, which then run over the rows the round chooses: a whole layer at
+six rows cost three verified rows the gap it closed. The verify's Engram rows are read from the verdict (its first
+row) and from the draft's read on (`engramAhead`). Busy 99.5% over 12 s of greedy, sampled and Chinese decode; a round
+at three rows 28.33 to 28.00 ms, greedy essays 72.4 to 73.9 tok/s. `MLX_SERVE_DSV41_CHAIN=0` is the old arm.
+Check: `[spec-stats] mode=dspark ... chained= led=` counts the rounds that ran so. A trace's own files push the Engram
+tables out of the page cache (40% of both): read them back before judging a trace, or the rows wait on the drive.
+Guard: `deepseek_v41 DSpark: a draft launched behind its verify`, `dsv41 lead: a layer stopped before its routed
+experts`, `DSpark verdict on the GPU`.

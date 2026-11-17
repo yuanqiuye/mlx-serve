@@ -111,6 +111,19 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   95% of a prompt's row reads) stay copies, since preads of one file top out near 586,000 a second whatever the
   threads. Staleness is the task's page-in count over a stretch of copies, never a copy's time: a first touch of a
   cached page is slow too.
+- A stage round hands the GPU its next draft behind the verify, drawn from the verdict the GPU picks (`dsparkDraftAhead`),
+  and the next verify's first layer behind that draft (`leadVerify`): the host reads each result while the step after
+  it runs. `MLX_SERVE_DSV41_CHAIN=0` is the arm where the host reads first. Not below one window of context.
+- Work queued behind a result closes the GPU's gap only when it READS that result: a buffer that does not runs beside
+  the work in flight and slows it by its own length (a keep-busy filler: the same idle, a round 0.9% longer).
+- A verify's lead runs every row of the block, before the round has chosen its rows: it stops before the routed experts
+  (`blockFusedTo`), which read weights a row's routes at a time. A whole first layer at six rows cost three verified
+  rows the gap it closed.
+- A verify behind its lead reads its Engram rows from the draft's read on (`engramAhead`, into the LRU) and takes them
+  in `spanIn` with no prefetch thread: a read begun where the verify is built left the GPU idle behind the lead.
+- A launched draft is read only as the draft of the verdict its round committed, at that state, position and token
+  (`dsparkFinish`, `Ahead.standsFor`); any other step drops it. The stages' windows keep the rows it read
+  (`Verify.kv`): the same rows projected again over the kept prefix come from another launch width.
 - A resident pack's mapped Engram tables are read into the page cache once the weights are loaded (`engram_direct.warm`,
   when what is free or reclaimable holds them; `MLX_SERVE_DSV41_ENGRAM_WARM=0`): the load pushes them out, and a row
   is a pread until its page is back.
