@@ -124,6 +124,34 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - A launched draft is read only as the draft of the verdict its round committed, at that state, position and token
   (`dsparkFinish`, `Ahead.standsFor`); any other step drops it. The stages' windows keep the rows it read
   (`Verify.kv`): the same rows projected again over the kept prefix come from another launch width.
+- Requests decoding together chain their rounds too (`MLX_SERVE_DSV41_CHAIN`): a plain batched step hands the GPU the
+  next step's window-only layers behind its draws (`leadBatched`), a draft goes behind the step before it
+  (`dsparkDraftAheadBatched` on a plain step's draws, `dsparkDraftAheadVerify` on each state's verdict the GPU picks),
+  and a verify's first rows behind its draft (`DraftLead`). Busy 96.7 / 97.2 / 98.2% to 99.3 / 99.6 / 99.5% at 2 / 4 / 8
+  requests (sampled: 95.9 / 97.2 / 98.0% to 99.4 / 99.5 / 99.5%).
+- A batched lead goes on through the Engram layer as soon as the host has read the step's tokens, before the round's
+  bookkeeping (`leadBatchedOn`): one layer of 8 rows runs 1.3 ms, and the next step's Engram read alone took 0.7 ms
+  of the host's 1.6-1.8 before its first layer was handed over.
+- A lead serves any step whose chunks START with its tokens: a verify's further rows run the lead's layers apart
+  (`leadRest`, a state a span at the position after its first row). A plain step behind a lead is the step's own
+  launches at its own widths, bit for bit, the Engram layer included (the pack: `DSV41_GROUP_LEAD`, 20 rounds). A
+  verify's further rows are as far from the whole verify's as the same rows stepped one after the other are: 1.19 at
+  most (rms 0.16) against 1.53 (rms 0.24), of a largest logit of 30. Judge that path against a second whole build,
+  never against bits: attention sums a row's keys in another grouping when its predecessor is already in the window.
+- The tiny fixtures carry no Engram layer: a path that reads Engram rows (`leadBatchedOn`, `leadRest`) is proven on a
+  pack or not at all.
+- A lead or a draft launched ahead is known by its states' identities, positions and tokens, never by a state's
+  address (slots swap states in and out of `dec_state`); any other step drops it, and a draft dropped is a draft's
+  GPU time lost (3% of them at 2-4 requests).
+- Everything a round reads of its step goes to the GPU as batches of its own BEFORE anything is queued behind the
+  step (the draws, the rows' own tokens, each sampled slot's verdict: `stochasticBegin`): an evaluation begun later is
+  signaled behind what was queued, and the host waited out the whole draft for it.
+- MLX holds the host to ten command buffers ahead of the GPU (`MAX_ACTIVE_TASKS`, `wait_for_one` inside
+  `async_eval`): at 8 requests the host spends half of every step blocked there, so a lead reaches the GPU only as the
+  step before it drains. A host that looks slow at building graphs there is waiting, not building.
+- A draft launched ahead is timed from the read of the step before it (`verdictRead`), which is when it began to run:
+  it is still cheaper than one built after the host's read (2.9 ms against 4.4), and the drafting backoff answers that
+  by drafting more often.
 - A resident pack's mapped Engram tables are read into the page cache once the weights are loaded (`engram_direct.warm`,
   when what is free or reclaimable holds them; `MLX_SERVE_DSV41_ENGRAM_WARM=0`): the load pushes them out, and a row
   is a pread until its page is back.

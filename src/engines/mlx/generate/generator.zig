@@ -171,6 +171,9 @@ pub const Generator = struct {
     /// (`dsv41_mod.dsparkDraftAhead`).
     dspark_chained: u64 = 0,
     dspark_led: u64 = 0,
+    /// Group rounds whose plain step had been begun behind the round before and was dropped (a copy, a stop, a slot
+    /// joining or leaving: `dsv41_mod.leadBatched`).
+    dspark_lost: u64 = 0,
     dspark_copy_drafted: u64 = 0,
     dspark_copy_accepted: u64 = 0,
     /// DeepSeek-V4.1's stage rounds under `dflash_policy` (verify rows by the confidence head, plain ticks

@@ -28,7 +28,8 @@ const capAcceptedForTokenBudget = @import("verify.zig").capAcceptedForTokenBudge
 const dsparkCopyLen = @import("verify.zig").dsparkCopyLen;
 const specDecodeUnsupported = @import("verify.zig").specDecodeUnsupported;
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
-const sampleRows = @import("../sampling/lazy.zig").sampleRows;
+const sampleRowsBegin = @import("../sampling/lazy.zig").sampleRowsBegin;
+const sampleRowsRead = @import("../sampling/lazy.zig").sampleRowsRead;
 
 /// Slots one group round carries.
 pub const MAX_SLOTS: usize = dflash_policy.MAX_GROUP_ROWS;
@@ -152,6 +153,8 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     const xfm = gens[0].xfm;
     const mdl = intree.dsv41(xfm).?;
     const gpa = allocs[0];
+    const led0 = mdl.ds_group_led;
+    const lost0 = mdl.ds_group_lost;
     var ctxs: [MAX_SLOTS]*ForwardCtx = undefined;
     for (gens, ctxs[0..n]) |g, *c| c.* = &g.ctx;
     var states: [MAX_SLOTS]*dsv41_mod.State = undefined;
@@ -191,8 +194,8 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     }
     var draft_ms: f32 = 0;
     if (n_stage > 0) {
-        const draft_watch = io_util.Stopwatch.init(gens[0].timer.io);
-        defer draft_ms = msOf(draft_watch.read());
+        // The module times the draft: one it launched behind the last step has run since that step ended.
+        defer draft_ms = @as(f32, @floatFromInt(mdl.ds_draft_ns)) / std.time.ns_per_ms;
         var sts: [MAX_SLOTS]*dsv41_mod.State = undefined;
         var t1s: [MAX_SLOTS]u32 = undefined;
         for (staged[0..n_stage], 0..) |k, i| {
@@ -200,7 +203,11 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
             t1s[i] = gens[k].next_token_id;
         }
         var blocks: [MAX_SLOTS]dsv41_mod.DsparkDraft = undefined;
-        try dsv41_mod.dsparkDraftBatched(mdl, gpa, sts[0..n_stage], t1s[0..n_stage], false, blocks[0..n_stage]);
+        // Every slot's chunk starts with its committed token, whatever the group then buys: the verify's first layers
+        // on those rows go to the GPU behind the draft.
+        var firsts: [MAX_SLOTS]u32 = undefined;
+        for (gens, firsts[0..n]) |g, *t| t.* = g.next_token_id;
+        try dsv41_mod.dsparkDraftBatched(mdl, gpa, sts[0..n_stage], t1s[0..n_stage], false, blocks[0..n_stage], .{ .states = states[0..n], .gens = ids[0..n], .t1s = firsts[0..n] });
         for (staged[0..n_stage], blocks[0..n_stage]) |k, b| {
             drafts[k].deinit(gpa);
             drafts[k] = b;
@@ -237,50 +244,191 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     const drafted = rows > n;
     const logits = try dsv41_mod.extendBatched(mdl, gpa, states[0..n], ids[0..n], chunks[0..n], drafted);
     defer _ = mlx.mlx_array_free(logits);
+    for (gens) |g| {
+        g.dspark_led += mdl.ds_group_led - led0;
+        g.dspark_lost += mdl.ds_group_lost - lost0;
+    }
     // Each slot's accept on its own rows. A slot's `t1` alone draws its next token with the others' in one batch, as the
     // plain batched tick does.
-    var greedy = false;
-    for (gens, rows_k[0..n]) |g, b| greedy = greedy or (b > 0 and !g.dspark_stochastic);
-    const best: []const i32 = if (greedy) try argmaxRows(gpa, logits, mdl.s) else &.{};
-    defer gpa.free(best);
     var accepted: [MAX_SLOTS]u32 = @splat(0);
     var next: [MAX_SLOTS]u32 = undefined;
+    var offs: [MAX_SLOTS]usize = undefined;
     var draw_rows: [MAX_SLOTS]mlx.mlx_array = undefined;
     var draw_params: [MAX_SLOTS]SamplingParams = undefined;
     var draw_slot: [MAX_SLOTS]usize = undefined;
+    var draw_of: [MAX_SLOTS]usize = undefined;
     var n_draw: usize = 0;
     defer for (draw_rows[0..n_draw]) |r| {
         _ = mlx.mlx_array_free(r);
     };
+    var greedy = false;
     var off: usize = 0;
     for (gens, chunks[0..n], 0..) |gen, ch, k| {
-        defer off += ch.len;
-        if (ch.len == 1) {
-            const row = try rowsOf(logits, off, 1, mdl.vocab, mdl.s);
-            defer _ = mlx.mlx_array_free(row);
-            var r = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(r);
-            try mlx.check(mlx.mlx_reshape(&r, row, &[_]c_int{ 1, 1, @intCast(mdl.vocab) }, 3, mdl.s));
-            draw_rows[n_draw] = r;
-            draw_params[n_draw] = gen.sampling;
-            draw_slot[n_draw] = k;
-            n_draw += 1;
-        } else if (gen.dspark_stochastic) {
-            const rows_l = try rowsOf(logits, off, ch.len, mdl.vocab, mdl.s);
-            defer _ = mlx.mlx_array_free(rows_l);
-            const v = try dspark.stochasticVerdict(gen, rows_l, ch, mdl.vocab, caps[k], null);
+        offs[k] = off;
+        off += ch.len;
+        if (ch.len > 1) {
+            greedy = greedy or !gen.dspark_stochastic;
+            continue;
+        }
+        const row = try rowsOf(logits, offs[k], 1, mdl.vocab, mdl.s);
+        defer _ = mlx.mlx_array_free(row);
+        var r = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(r);
+        try mlx.check(mlx.mlx_reshape(&r, row, &[_]c_int{ 1, 1, @intCast(mdl.vocab) }, 3, mdl.s));
+        draw_rows[n_draw] = r;
+        draw_params[n_draw] = gen.sampling;
+        draw_slot[n_draw] = k;
+        draw_of[k] = n_draw;
+        n_draw += 1;
+    }
+    // What the GPU makes of the rows before the host reads anything: the lone tokens' draws, and every row's own token
+    // for the greedy slots.
+    const draws: mlx.mlx_array = if (n_draw > 0) try sampleRowsBegin(draw_rows[0..n_draw], draw_params[0..n_draw], mdl.s) else .{ .ctx = null };
+    defer if (draws.ctx != null) {
+        _ = mlx.mlx_array_free(draws);
+    };
+    const am: mlx.mlx_array = if (greedy) try argmaxLazy(logits, mdl.s) else .{ .ctx = null };
+    defer if (am.ctx != null) {
+        _ = mlx.mlx_array_free(am);
+    };
+    // Both are one batch of their own: a wait on either ends with the verify, not with what is queued behind it.
+    {
+        var both: [2]mlx.mlx_array = undefined;
+        var n_both: usize = 0;
+        for ([_]mlx.mlx_array{ draws, am }) |a| if (a.ctx != null) {
+            both[n_both] = a;
+            n_both += 1;
+        };
+        if (n_both > 0) {
+            const vec = mlx.mlx_vector_array_new_data(&both, n_both);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_async_eval(vec));
+        }
+    }
+    // A sampled slot's verdict on its drafts goes to the GPU too, read further down: an evaluation begun after
+    // something is queued behind the verify would wait for that to run.
+    var sampled: [MAX_SLOTS]?dspark.Sampled = @splat(null);
+    defer for (&sampled) |*sv| if (sv.*) |*x| x.deinit();
+    for (gens, chunks[0..n], 0..) |gen, ch, k| if (ch.len > 1 and gen.dspark_stochastic) {
+        const rows_l = try rowsOf(logits, offs[k], ch.len, mdl.vocab, mdl.s);
+        defer _ = mlx.mlx_array_free(rows_l);
+        sampled[k] = try dspark.stochasticBegin(gen, rows_l, ch, mdl.vocab, caps[k], true);
+    };
+    // The round after this one, as far as it can be told now, goes to the GPU behind this one's verdict: a plain step's
+    // first layers (`dsv41_mod.leadBatched`), or the next draft (`dsparkDraftAheadBatched`, `dsparkDraftAheadVerify`).
+    const draft_share = if (n_stage > 0) draft_ms / @as(f32, @floatFromInt(n_stage)) else 0;
+    const stages = n <= stageSlotsMax() and n < dflash_policy.MAX_GROUP_ROWS;
+    if (!drafted and plainNext(gens, caps[0..n], kinds[0..n], draft_share)) {
+        try dsv41_mod.leadBatched(mdl, gpa, states[0..n], ids[0..n], draws);
+    } else if (stages) ahead: {
+        // The slots due a stage draft next round. A slot whose drafts are in this verify is weighed by what its rows
+        // are expected to keep; the round's end records what they kept.
+        const token_ms = cost.ms(n, n) / @as(f32, @floatFromInt(n));
+        var due: [MAX_SLOTS]usize = undefined;
+        var n_due: usize = 0;
+        for (gens, 0..) |gen, k| {
+            var expect: f32 = 0;
+            var alive: f32 = 1;
+            for (p[k][0..rows_k[k]]) |pj| {
+                alive *= pj;
+                expect += alive;
+            }
+            const spent = draft_share + @as(f32, @floatFromInt(rows_k[k])) * cost.rowMs();
+            if (caps[k] == 0 or !stagesNext(gen, kinds[k], expect * token_ms, spent)) continue;
+            if (drafted and !dsv41_mod.aheadFitsVerify(mdl, states[k])) break :ahead;
+            // A rule whose verdict the GPU does not pick (TokenV3, a keyed request's serial one) is the host's alone.
+            if (sampled[k]) |sv| if (sv.lazy == null) break :ahead;
+            due[n_due] = k;
+            n_due += 1;
+        }
+        if (n_due == 0) break :ahead;
+        var due_states: [MAX_SLOTS]*dsv41_mod.State = undefined;
+        var due_ids: [MAX_SLOTS]u64 = undefined;
+        for (due[0..n_due], due_states[0..n_due], due_ids[0..n_due]) |k, *st, *id| {
+            st.* = states[k];
+            id.* = ids[k];
+        }
+        // Each due slot's verdict, still the GPU's: its draw, or the drafts its rows' own tokens agree with.
+        var verdicts: [MAX_SLOTS]dsv41_mod.LazyVerdict = undefined;
+        var picked: usize = 0;
+        defer for (verdicts[0..picked]) |v| {
+            _ = mlx.mlx_array_free(v.kept);
+            _ = mlx.mlx_array_free(v.next);
+        };
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        if (draws.ctx != null) {
+            var shaped = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(shaped);
+            try mlx.check(mlx.mlx_reshape(&shaped, draws, &[_]c_int{@intCast(n_draw)}, 1, mdl.s));
+            try mlx.check(mlx.mlx_astype(&flat, shaped, .int32, mdl.s));
+        }
+        for (due[0..n_due]) |k| {
+            if (sampled[k]) |sv| {
+                var kept = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(kept);
+                try mlx.check(mlx.mlx_array_set(&kept, sv.lazy.?[0]));
+                var after = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(after);
+                try mlx.check(mlx.mlx_array_set(&after, sv.lazy.?[1]));
+                verdicts[picked] = .{ .kept = kept, .next = after };
+            } else if (chunks[k].len > 1) {
+                verdicts[picked] = try dsv41_mod.greedyVerdictRows(mdl, gpa, am, offs[k], chunks[k], caps[k]);
+            } else {
+                var one = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(one);
+                const at: c_int = @intCast(draw_of[k]);
+                try mlx.check(mlx.mlx_slice(&one, flat, &[_]c_int{at}, 1, &[_]c_int{at + 1}, 1, &[_]c_int{1}, 1, mdl.s));
+                verdicts[picked] = .{ .kept = mlx.mlx_array_new_int(0), .next = one };
+            }
+            picked += 1;
+        }
+        if (drafted) {
+            try dsv41_mod.dsparkDraftAheadVerify(mdl, due_states[0..n_due], due_ids[0..n_due], verdicts[0..n_due]);
+        } else {
+            var nexts: [MAX_SLOTS]mlx.mlx_array = undefined;
+            for (verdicts[0..n_due], nexts[0..n_due]) |v, *t| t.* = v.next;
+            const vec = mlx.mlx_vector_array_new_data(&nexts, n_due);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var mine = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(mine);
+            try mlx.check(mlx.mlx_concatenate_axis(&mine, vec, 0, mdl.s));
+            try dsv41_mod.dsparkDraftAheadBatched(mdl, due_states[0..n_due], due_ids[0..n_due], mine);
+        }
+    }
+    // The rows' own tokens and the draws, each a batch of its own where nothing above made one: a wait on either ends
+    // with the verify, not with what was queued behind it.
+    const best: []const i32 = if (greedy) try hostInts(gpa, am) else &.{};
+    defer gpa.free(best);
+    // The first read that waited for the step marks when it ended (`dsv41_mod.verdictRead`).
+    var unmarked = !greedy;
+    if (greedy) dsv41_mod.verdictRead(mdl);
+    for (gens, chunks[0..n], 0..) |gen, ch, k| {
+        if (ch.len == 1) continue;
+        if (sampled[k]) |*sv| {
+            const v = try dspark.stochasticFinish(gen, sv);
+            if (unmarked) dsv41_mod.verdictRead(mdl);
+            unmarked = false;
             accepted[k] = v.accepted;
             next[k] = v.next_token;
         } else {
             var a: u32 = 0;
-            while (a + 1 < ch.len and @as(u32, @intCast(best[off + a])) == ch[a + 1]) a += 1;
+            while (a + 1 < ch.len and @as(u32, @intCast(best[offs[k] + a])) == ch[a + 1]) a += 1;
             accepted[k] = @min(a, caps[k]);
-            next[k] = @intCast(best[off + accepted[k]]);
+            next[k] = @intCast(best[offs[k] + accepted[k]]);
         }
     }
     if (n_draw > 0) {
         var drawn: [MAX_SLOTS]i32 = undefined;
-        try sampleRows(drawn[0..n_draw], draw_rows[0..n_draw], draw_params[0..n_draw], mdl.s);
+        try sampleRowsRead(drawn[0..n_draw], draws);
+        if (unmarked) dsv41_mod.verdictRead(mdl);
+        // The step begun behind this one goes on through the layers that need its tokens, before this round's
+        // bookkeeping: its first layers run for less time than that takes.
+        if (n_draw == n and dsv41_mod.groupLeadStands(mdl)) {
+            var toks: [MAX_SLOTS]u32 = undefined;
+            for (toks[0..n], drawn[0..n]) |*t, d| t.* = @intCast(d);
+            try dsv41_mod.leadBatchedOn(mdl, gpa, states[0..n], ids[0..n], toks[0..n]);
+        }
         for (draw_slot[0..n_draw], drawn[0..n_draw], draw_params[0..n_draw]) |k, t, sp| {
             next[k] = @intCast(t);
             gens[k].sampling.draw = sp.draw;
@@ -322,6 +470,33 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     };
 }
 
+/// Whether a slot drafts from the stages in the round after this one, as this round can tell before its verdict is
+/// read. A slot that did not stage this round stages once its backoff owes no more plain rounds; one that staged
+/// records, at the round's end, what its drafts kept against what drafting cost the round (`spent`): `gain` stands
+/// for that (nothing where no draft of its was bought, else what its rows are expected to keep).
+fn stagesNext(gen: *const Generator, kind: Kind, gain: f32, spent: f32) bool {
+    const pol = if (gen.dspark_pol) |*pp| pp else return true;
+    if (kind != .stage) return pol.drafting.owed == 0;
+    var after = pol.drafting;
+    after.record(gain, spent);
+    return after.owed == 0;
+}
+
+/// Whether the round after a round that bought no draft is expected to be a plain step for every one of `gens`
+/// (`caps[k]`: the tokens slot k may still take after this round's): no slot is at its budget's end, and none is due a
+/// stage draft (a group past `stageSlotsMax` drafts none; `spent`: a staged slot's share of this round's draft). A
+/// copy from the context or a stop is not foreseen: the step begun for that round then serves the copy's first rows,
+/// or is dropped (`dsv41_mod.leadBatched`).
+fn plainNext(gens: []const *Generator, caps: []const u32, kinds: []const Kind, spent: f32) bool {
+    const n = gens.len;
+    const stages = n <= stageSlotsMax() and n < dflash_policy.MAX_GROUP_ROWS;
+    for (gens, caps, kinds) |gen, cap, kind| {
+        if (cap == 0) return false;
+        if (stages and stagesNext(gen, kind, 0, spent)) return false;
+    }
+    return true;
+}
+
 /// Rows [lo, lo + n) of `logits` `[R, V]` (caller frees).
 fn rowsOf(logits: mlx.mlx_array, lo: usize, n: usize, vocab: usize, s: mlx.mlx_stream) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
@@ -330,17 +505,22 @@ fn rowsOf(logits: mlx.mlx_array, lo: usize, n: usize, vocab: usize, s: mlx.mlx_s
     return o;
 }
 
-/// Every row's argmax of `logits` `[R, V]` on the host (caller frees).
-fn argmaxRows(gpa: std.mem.Allocator, logits: mlx.mlx_array, s: mlx.mlx_stream) ![]i32 {
+/// Every row's own token of `logits` `[R, V]`: `[R]` int32, not evaluated (caller frees).
+fn argmaxLazy(logits: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var am = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(am);
     try mlx.check(mlx.mlx_argmax_axis(&am, logits, -1, false, s));
     var am32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(am32);
+    errdefer _ = mlx.mlx_array_free(am32);
     try mlx.check(mlx.mlx_astype(&am32, am, .int32, s));
-    try mlx.check(mlx.mlx_array_eval(am32));
-    const data = mlx.mlx_array_data_int32(am32) orelse return error.NoData;
-    return gpa.dupe(i32, data[0..mlx.mlx_array_size(am32)]);
+    return am32;
+}
+
+/// An int32 array's values on the host (caller frees).
+fn hostInts(gpa: std.mem.Allocator, a: mlx.mlx_array) ![]i32 {
+    try mlx.check(mlx.mlx_array_eval(a));
+    const data = mlx.mlx_array_data_int32(a) orelse return error.NoData;
+    return gpa.dupe(i32, data[0..mlx.mlx_array_size(a)]);
 }
 
 fn msOf(ns: u64) f32 {

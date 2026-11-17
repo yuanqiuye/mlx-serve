@@ -557,6 +557,14 @@ pub const Dsv41Model = struct {
     next_draft: ?Ahead = null,
     /// The next verify's first layers, handed to the GPU behind the draft in hand (`leadVerify`).
     lead: ?Lead = null,
+    /// The next plain batched step's first layers, handed to the GPU behind the step in hand (`leadBatched`).
+    group_lead: ?GroupLead = null,
+    /// The next round's batched draft, handed to the GPU behind the step in hand (`dsparkDraftAheadBatched`).
+    group_draft: ?GroupAhead = null,
+    ds_group_draft_lost: u64 = 0,
+    /// Plain batched steps whose first layers ran behind the step before them, and leads no step took.
+    ds_group_led: u64 = 0,
+    ds_group_lost: u64 = 0,
     /// When the last verdict was read and when the draft in hand began (`monoUs`): a draft launched behind a verify
     /// has run since that verify's verdict.
     ds_verdict_us: i64 = 0,
@@ -581,6 +589,22 @@ pub const Dsv41Model = struct {
         self.lead = null;
     }
 
+    fn dropGroupDraft(self: *Dsv41Model) void {
+        if (self.group_draft) |*a| {
+            a.deinit();
+            self.ds_group_draft_lost += 1;
+        }
+        self.group_draft = null;
+    }
+
+    fn dropGroupLead(self: *Dsv41Model) void {
+        if (self.group_lead) |*l| {
+            l.deinit();
+            self.ds_group_lost += 1;
+        }
+        self.group_lead = null;
+    }
+
     fn dropAhead(self: *Dsv41Model) void {
         if (self.ahead) |a| a.finish();
         self.ahead = null;
@@ -594,6 +618,8 @@ pub const Dsv41Model = struct {
         self.dropDraftScope();
         self.dropNextDraft();
         self.dropLead();
+        self.dropGroupLead();
+        self.dropGroupDraft();
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
         self.gpa.free(self.prompt);
@@ -5044,6 +5070,8 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     const d = c.hidden_size;
     // A draft launched ahead and not read by now is no round's; a verify's lead serves the rows it began with.
     m.dropNextDraft();
+    m.dropGroupLead();
+    m.dropGroupDraft();
     var lead: ?Lead = m.lead;
     m.lead = null;
     defer if (lead) |*l| l.deinit();
@@ -6580,6 +6608,8 @@ fn restore(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize {
     const sn = if (st.snap) |*sn| sn else return 0;
     if (sn.gen != m.state_gen or sn.ids.len >= prompt.len or !std.mem.eql(u32, sn.ids, prompt[0..sn.ids.len])) return 0;
     if (sn.vision_key != try visionKey(vision_rows, m.imageRows(sn.ids))) return 0;
+    m.dropGroupLead();
+    m.dropGroupDraft();
     try applySnap(st, sn);
     return st.n;
 }
@@ -6589,6 +6619,8 @@ fn restoreAt(m: *Dsv41Model, n: usize) !bool {
     const st = if (m.dec_state) |*st| st else return false;
     const sn = if (st.snap) |*sn| sn else return false;
     if (sn.gen != m.state_gen or sn.n != n) return false;
+    m.dropGroupLead();
+    m.dropGroupDraft();
     try applySnap(st, sn);
     return true;
 }
@@ -6745,6 +6777,17 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     const N = chunks.len;
     m.dropNextDraft();
     m.dropLead();
+    m.dropGroupDraft();
+    // The step's first layers may have run behind the step before it (`leadBatched`): a plain step of the same
+    // states on the tokens that lead embedded starts past them. Any other step lets the lead go.
+    var lead: ?GroupLead = m.group_lead;
+    m.group_lead = null;
+    defer if (lead) |*l| l.deinit();
+    if (lead) |*l| if (states.len != N or gens.len != N or !chains(m) or !l.serves(states, gens, chunks)) {
+        l.deinit();
+        lead = null;
+        m.ds_group_lost += 1;
+    };
     if (N == 0 or N > region_rows or states.len != N or gens.len != N or m.pair != null or m.streamed != null) return error.Dsv41BatchUnsupported;
     const offs = try gpa.alloc(usize, N + 1);
     defer gpa.free(offs);
@@ -6813,7 +6856,12 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     sp.eng_ids = eng_ids;
     sp.ncols = ncols;
     sp.prefetch = prefetch;
-    {
+    var from: usize = 0;
+    if (lead) |*l| {
+        try leadRest(m, gpa, states, chunks, &sp, l);
+        from = l.hi;
+        m.ds_group_led += 1;
+    } else {
         var sc = Scope.init(gpa, m.s);
         defer sc.deinit();
         const all = try gpa.alloc(u32, R);
@@ -6826,7 +6874,7 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
             hold(&sp.pres[k], try onehotPre(&sc, m, hi - lo));
         }
     }
-    for (0..m.n_layers) |li| {
+    for (from..m.n_layers) |li| {
         try batchedLayer(m, gpa, states, &sp, li);
         if (li + 1 == m.n_layers) break;
         // As a solo decode step: hand each layer to the GPU as it is built.
@@ -6862,6 +6910,104 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     try mlx.check(mlx.mlx_async_eval(vec));
     if (!verify) for (states, gens) |st, g| try snapshotStateIfDue(st, g);
     return sc.out(logits);
+}
+
+/// A batched step's rows entering layer `l.hi` behind its lead `l`: each state's first row is the lead's; a chunk's
+/// further rows (a verify's drafts, a copy) run the lead's layers here, a state a span at the position after its first
+/// row, and follow it. Those layers keep a window alone, which a verify rolls back by position. A further row then
+/// finds its first row already in the window where the whole verify computes both in one launch: the same keys summed
+/// in another grouping, as far from the whole verify's logits as the row stepped after its predecessor is.
+fn leadRest(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, chunks: []const []const u32, sp: *const Spans, l: *const GroupLead) !void {
+    const c = &m.cfg;
+    const N = states.len;
+    var rest: [dkern.max_rows]*State = undefined;
+    var of: [dkern.max_rows]usize = undefined;
+    var roffs: [dkern.max_rows + 1]usize = undefined;
+    var M: usize = 0;
+    roffs[0] = 0;
+    for (states, chunks, 0..) |st, ch, k| if (ch.len > 1) {
+        rest[M] = st;
+        of[M] = k;
+        roffs[M + 1] = roffs[M] + ch.len - 1;
+        M += 1;
+    };
+    if (M == 0) {
+        for (0..N) |k| {
+            hold(&sp.xs[k], l.xs[k]);
+            hold(&sp.pres[k], l.pres[k]);
+        }
+        return;
+    }
+    const Rr = roffs[M];
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const per_row = m.engrams.len * sp.ncols;
+    const ids = try gpa.alloc(u32, Rr);
+    defer gpa.free(ids);
+    const eng = try gpa.alloc(u32, Rr * per_row);
+    defer gpa.free(eng);
+    for (of[0..M], 0..) |k, j| {
+        const ch = chunks[k];
+        const lo, _ = sp.bounds(k);
+        @memcpy(ids[roffs[j]..roffs[j + 1]], ch[1..]);
+        if (per_row > 0) @memcpy(eng[roffs[j] * per_row .. roffs[j + 1] * per_row], sp.eng_ids[(lo + 1) * per_row ..][0 .. (ch.len - 1) * per_row]);
+    }
+    // The Engram rows these layers write are read at once into the LRU, where `spanIn` takes them.
+    if (per_row > 0 and Rr * sp.ncols <= edec.max_early) {
+        const mine = try gpa.alloc(u32, Rr * sp.ncols);
+        defer gpa.free(mine);
+        for (m.engrams, 0..) |*e, ek| {
+            if (e.layer >= l.hi) continue;
+            for (0..Rr) |t| @memcpy(mine[t * sp.ncols ..][0..sp.ncols], eng[(t * m.engrams.len + ek) * sp.ncols ..][0..sp.ncols]);
+            e.table.readEarly(ek, mine);
+        }
+    }
+    var rheld: [4 * dkern.max_rows]A = @splat(none);
+    defer for (rheld) |x| if (x.ctx != null) {
+        _ = mlx.mlx_array_free(x);
+    };
+    var rsp = spansOf(rheld[0 .. 4 * M], M, 0, 1, Rr, 0);
+    rsp.offs = roffs[0 .. M + 1];
+    rsp.eng_ids = eng;
+    rsp.ncols = sp.ncols;
+    const emb = try embedIds(m, &sc, ids, m.act);
+    for (0..M) |j| {
+        const lo, const hi = rsp.bounds(j);
+        hold(&rsp.xs[j], try sc.broadcast(try sc.expand(try sc.slice(emb, 0, lo, hi), 1), &.{ ci(hi - lo), ci(c.dsv4_hc_mult), ci(c.hidden_size) }));
+        hold(&rsp.pres[j], try onehotPre(&sc, m, hi - lo));
+    }
+    {
+        // Each of these states' rows follow its first, which the lead wrote at the state's position.
+        for (rest[0..M]) |st| st.n += 1;
+        defer for (rest[0..M]) |st| {
+            st.n -= 1;
+        };
+        var ev: std.ArrayList(A) = .empty;
+        defer ev.deinit(gpa);
+        for (0..l.hi) |li| {
+            try batchedLayer(m, gpa, rest[0..M], &rsp, li);
+            // Handed over layer by layer: the GPU runs one while the next waits on its Engram rows.
+            ev.clearRetainingCapacity();
+            for (0..M) |j| {
+                try ev.append(gpa, rsp.xs[j]);
+                try ev.append(gpa, rsp.pres[j]);
+            }
+            for (rest[0..M]) |st| try appendLayerState(gpa, &ev, &st.layers[li]);
+            try asyncEvalAll(ev.items);
+        }
+    }
+    for (rsp.topks, rsp.cands) |t, cd| if (t.ctx != null or cd.ctx != null) return error.Dsv41LeadLayer;
+    var j: usize = 0;
+    for (0..N) |k| {
+        if (chunks[k].len == 1) {
+            hold(&sp.xs[k], l.xs[k]);
+            hold(&sp.pres[k], l.pres[k]);
+            continue;
+        }
+        hold(&sp.xs[k], try sc.concat(&.{ l.xs[k], rsp.xs[j] }, 0));
+        hold(&sp.pres[k], try sc.concat(&.{ l.pres[k], rsp.pres[j] }, 0));
+        j += 1;
+    }
 }
 
 /// Layer `li` of `extendBatched`: the compiled stretches over every state's rows, attention per state.
@@ -7212,6 +7358,8 @@ pub fn dsparkDraftCollect(m: *Dsv41Model, gpa: std.mem.Allocator, a: *DraftAhead
 fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_logits: bool) !DsparkDraft {
     m.dropDraftScope();
     m.dropLead();
+    m.dropGroupLead();
+    m.dropGroupDraft();
     if (m.next_draft) |*a| if (!keep_logits and a.standsFor(m, st, t1)) {
         // The draft has run since the verify before it ended. The verify after it starts on its rows before the
         // host has read them (`leadVerify`): its layers that need nothing of the host's.
@@ -7431,6 +7579,209 @@ fn leadVerify(m: *Dsv41Model, st: *State, t1: u32, toks: A) !void {
     m.lead = lead;
 }
 
+/// The next plain batched step's layers before its first Engram layer (`leadLayers`), handed to the GPU behind the
+/// step whose draws are its rows: one row a state at its own position, the tokens (`toks`, `[n]` int32) still the
+/// GPU's. `extendBatched` takes it for the same states at the same positions stepping those tokens, and starts at
+/// layer `hi`; the launches are the step's own at its own width, so the step's rows are the bits it makes alone.
+const GroupLead = struct {
+    /// Each state's stream and FFN mix after layer `hi - 1`.
+    xs: [dkern.max_rows]A = @splat(none),
+    pres: [dkern.max_rows]A = @splat(none),
+    toks: A,
+    /// The same tokens once the host has them (`leadBatchedOn`, or a lead begun from tokens the host held).
+    host: ?[dkern.max_rows]u32 = null,
+    n: usize,
+    hi: usize,
+    gens: [dkern.max_rows]u64 = undefined,
+    p0s: [dkern.max_rows]usize = undefined,
+
+    fn deinit(self: *GroupLead) void {
+        for (&self.xs, &self.pres) |*x, *p| for ([_]*A{ x, p }) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a.*);
+            a.* = none;
+        };
+        _ = mlx.mlx_array_free(self.toks);
+    }
+
+    /// Whether a step of `chunks` on `states` starts with the rows this lead began: the same states in the same
+    /// order, each where the lead stood, its chunk's first token the one the lead embedded. A chunk's further rows (a
+    /// verify's drafts) run the lead's layers behind it (`leadRest`).
+    fn serves(self: *const GroupLead, states: []const *State, gens: []const u64, chunks: []const []const u32) bool {
+        if (states.len != self.n) return false;
+        // Without the host's copy the tokens are a step's draws, a batch of their own the host has read since: the
+        // wait is over before it starts.
+        if (self.host == null and mlx.mlx_array_eval(self.toks) != 0) return false;
+        const gpu: ?[*]const i32 = if (self.host == null) mlx.mlx_array_data_int32(self.toks) orelse return false else null;
+        for (states, gens, chunks, 0..) |st, g, ch, k| {
+            const tok: i64 = if (self.host) |h| h[k] else gpu.?[k];
+            if (g != self.gens[k] or st.n != self.p0s[k] or st.verify != null or ch.len == 0 or @as(i64, ch[0]) != tok) return false;
+        }
+        return true;
+    }
+};
+
+/// Whether a plain batched step of `n` states can take its first layers behind the step before it (`leadBatched`).
+pub fn leadsBatched(m: *const Dsv41Model, n: usize) bool {
+    return chains(m) and n >= 2 and n <= dkern.max_rows and leadLayers(m) > 0;
+}
+
+/// The next plain batched step of `states` (identities `gens`), begun behind the step in hand: `draws` (`[n]`, any
+/// integer type) are that step's sampled tokens, state by state, the host has not read. They go to the GPU as their
+/// own batch (a wait on them ends with the step, not with these layers), then the layers before the first Engram
+/// layer run on them. A no-op where `leadsBatched` says no.
+pub fn leadBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, draws: A) !void {
+    return leadBatchedBehind(m, gpa, states, gens, draws, null, null);
+}
+
+/// `leadBatched` from tokens the host holds (`host`, the values of `draws`), queued behind `behind`, an array of
+/// work in flight these layers do not otherwise read (a draft whose verify they begin): reading it puts them after
+/// that work, where layers queued beside it would run beside it and slow both.
+fn leadBatchedBehind(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, draws: A, behind: ?A, host: ?[]const u32) !void {
+    m.dropGroupLead();
+    const N = states.len;
+    if (!leadsBatched(m, N) or gens.len != N or mlx.mlx_array_size(draws) != N) return;
+    for (states, 0..) |st, k| {
+        if (st.verify != null) return;
+        for (states[0..k]) |o| if (o == st) return;
+    }
+    const c = &m.cfg;
+    const hi = leadLayers(m);
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    var toks = try sc.astype(try sc.reshape(draws, &.{ci(N)}), .int32);
+    if (behind) |b| {
+        // The first element of `behind`, times zero: the tokens' values with that work's order.
+        const first = try sc.astype(try sc.slice(try sc.reshape(b, &.{-1}), 0, 0, 1), .int32);
+        toks = try sc.add(toks, try sc.mul(first, try sc.i(0)));
+    }
+    try asyncEvalAll(&.{ draws, toks });
+    var held: [4 * dkern.max_rows]A = @splat(none);
+    defer for (held) |x| if (x.ctx != null) {
+        _ = mlx.mlx_array_free(x);
+    };
+    var offs: [dkern.max_rows + 1]usize = undefined;
+    for (offs[0 .. N + 1], 0..) |*o, k| o.* = k;
+    var sp = spansOf(held[0 .. 4 * N], N, 0, 1, N, 0);
+    sp.offs = offs[0 .. N + 1];
+    const emb = try m.embed.rows(&sc, toks, m.act);
+    for (0..N) |k| {
+        hold(&sp.xs[k], try sc.broadcast(try sc.expand(try sc.slice(emb, 0, k, k + 1), 1), &.{ 1, ci(c.dsv4_hc_mult), ci(c.hidden_size) }));
+        hold(&sp.pres[k], try onehotPre(&sc, m, 1));
+    }
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(gpa);
+    for (0..hi) |li| {
+        try batchedLayer(m, gpa, states, &sp, li);
+        for (states) |st| try appendLayerState(gpa, &ev, &st.layers[li]);
+    }
+    // These layers hand nothing down but their stream and mix (`leadLayers`: no compressor, no indexer).
+    for (sp.topks, sp.cands) |t, cd| if (t.ctx != null or cd.ctx != null) return error.Dsv41LeadLayer;
+    var lead: GroupLead = .{ .toks = ref(toks), .n = N, .hi = hi };
+    errdefer lead.deinit();
+    if (host) |h| {
+        if (h.len != N) return error.Dsv41LeadLayer;
+        lead.host = @splat(0);
+        @memcpy(lead.host.?[0..N], h);
+    }
+    for (0..N) |k| {
+        lead.xs[k] = ref(sp.xs[k]);
+        lead.pres[k] = ref(sp.pres[k]);
+        lead.gens[k] = gens[k];
+        lead.p0s[k] = states[k].n;
+        try ev.append(gpa, sp.xs[k]);
+        try ev.append(gpa, sp.pres[k]);
+    }
+    try asyncEvalAll(ev.items);
+    m.group_lead = lead;
+}
+
+/// A batched round has read its step's verdict: what was queued behind that step has run from about now
+/// (`dsparkDraftBatched` times a draft launched ahead from here).
+pub fn verdictRead(m: *Dsv41Model) void {
+    m.ds_verdict_us = monoUs();
+}
+
+/// Whether a plain batched step's first layers are with the GPU (`leadBatched`) and no step has taken them yet.
+pub fn groupLeadStands(m: *const Dsv41Model) bool {
+    return m.group_lead != null;
+}
+
+/// The layers a batched step can run before the round it belongs to has begun, once the host has its tokens: those
+/// before the first compressor or DSpark target. An Engram layer among them reads its rows off each state's history
+/// without moving it (`leadBatchedOn`).
+fn leadLayersOn(m: *const Dsv41Model) usize {
+    var hi: usize = 0;
+    while (hi < m.n_layers and m.ratio(hi) == 0 and m.dsparkTarget(hi) == null) hi += 1;
+    return hi;
+}
+
+/// The lead of `leadBatched` carried on through the window-only layers behind it (`leadLayersOn`), now that the host
+/// has read the step's draws `toks` (a token a state): the GPU runs the lead's first layers for less time than the
+/// round's bookkeeping and the next step's Engram read take, so the layer that needs the tokens is handed over before
+/// either. Each state's Engram rows are hashed off its history, which the step itself moves, and read at once into the
+/// LRU. A no-op without a lead for these states and tokens.
+pub fn leadBatchedOn(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, toks: []const u32) !void {
+    const l = &(m.group_lead orelse return);
+    const N = states.len;
+    const hi = leadLayersOn(m);
+    if (hi <= l.hi or toks.len != N or gens.len != N or m.pair != null) return;
+    var chunks: [dkern.max_rows][]const u32 = undefined;
+    for (toks, chunks[0..N], 0..) |*t, *ch, k| {
+        if (k >= l.n) return;
+        ch.* = t[0..1];
+    }
+    if (!l.serves(states, gens, chunks[0..N])) return;
+    if (l.host == null) {
+        l.host = @splat(0);
+        @memcpy(l.host.?[0..N], toks);
+    }
+    // Every state's row ids, a row a state as `extendBatched` lays them out, and each table's rows read now.
+    const nc: usize = if (m.hash) |*hs| hs.cols() else 0;
+    const per_row = m.engrams.len * nc;
+    const eng_ids = try gpa.alloc(u32, N * per_row);
+    defer gpa.free(eng_ids);
+    if (m.hash) |*hs| {
+        if (hs.n_layers != m.engrams.len) return;
+        for (states, toks, 0..) |st, t, k| hs.rows(st.hist.items, &.{m.compressedId(t, false)}, eng_ids[k * per_row ..][0..per_row]);
+        const mine = try gpa.alloc(u32, N * nc);
+        defer gpa.free(mine);
+        for (m.engrams, 0..) |*e, ek| {
+            if (e.layer < l.hi or e.layer >= hi) continue;
+            for (0..N) |k| @memcpy(mine[k * nc ..][0..nc], eng_ids[(k * m.engrams.len + ek) * nc ..][0..nc]);
+            e.table.readEarly(ek, mine);
+        }
+    }
+    var held: [4 * dkern.max_rows]A = @splat(none);
+    defer for (held) |x| if (x.ctx != null) {
+        _ = mlx.mlx_array_free(x);
+    };
+    var offs: [dkern.max_rows + 1]usize = undefined;
+    for (offs[0 .. N + 1], 0..) |*o, k| o.* = k;
+    var sp = spansOf(held[0 .. 4 * N], N, 0, 1, N, 0);
+    sp.offs = offs[0 .. N + 1];
+    sp.eng_ids = eng_ids;
+    sp.ncols = nc;
+    for (0..N) |k| {
+        hold(&sp.xs[k], l.xs[k]);
+        hold(&sp.pres[k], l.pres[k]);
+    }
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(gpa);
+    for (l.hi..hi) |li| {
+        try batchedLayer(m, gpa, states, &sp, li);
+        for (states) |st| try appendLayerState(gpa, &ev, &st.layers[li]);
+    }
+    for (sp.topks, sp.cands) |t, cd| if (t.ctx != null or cd.ctx != null) return error.Dsv41LeadLayer;
+    for (0..N) |k| {
+        hold(&l.xs[k], sp.xs[k]);
+        hold(&l.pres[k], sp.pres[k]);
+        try ev.append(gpa, sp.xs[k]);
+        try ev.append(gpa, sp.pres[k]);
+    }
+    l.hi = hi;
+    try asyncEvalAll(ev.items);
+}
+
 /// `draftRows`' graph (its arrays `sc`'s): the ids, the confidences (the ids again without them) and the rows `keep_logits`
 /// reads (the ids again otherwise).
 const DraftGraph = struct { ev: [3]A, want_conf: bool };
@@ -7525,47 +7876,247 @@ fn draftRead(sc: *Scope, m: *const Dsv41Model, gpa: std.mem.Allocator, t1: u32, 
     return .{ .ids = out_ids, .len = len, .logits = host_logits, .confidence = conf };
 }
 
+/// The verify a batched draft is followed by, for `dsparkDraftBatched` to begin behind the draft: every state of the
+/// round (those that do not draft too), its identity and the token its chunk starts with.
+pub const DraftLead = struct {
+    states: []const *State,
+    gens: []const u64,
+    t1s: []const u32,
+
+    /// Whether the model's standing lead already began these rows.
+    fn stands(self: *const DraftLead, m: *const Dsv41Model) bool {
+        const l = &(m.group_lead orelse return false);
+        if (self.states.len > dkern.max_rows or self.gens.len != self.states.len or self.t1s.len != self.states.len) return false;
+        var chunks: [dkern.max_rows][]const u32 = undefined;
+        for (self.t1s, chunks[0..self.t1s.len]) |*t, *ch| ch.* = t[0..1];
+        return l.serves(self.states, self.gens, chunks[0..self.t1s.len]);
+    }
+
+    /// The rows' first layers queued behind `draft` (an output of the draft in flight), through the layer that needs
+    /// their tokens.
+    fn launch(self: *const DraftLead, m: *Dsv41Model, gpa: std.mem.Allocator, draft: A) !void {
+        const N = self.states.len;
+        if (!leadsBatched(m, N) or self.gens.len != N or self.t1s.len != N) return;
+        var sc = Scope.init(gpa, m.s);
+        defer sc.deinit();
+        try leadBatchedBehind(m, gpa, self.states, self.gens, try sc.ints(@ptrCast(self.t1s), &.{ci(N)}), draft, self.t1s);
+        try leadBatchedOn(m, gpa, self.states, self.gens, self.t1s);
+    }
+};
+
 /// `dsparkDraft` of each of `states` from its committed token `t1s[k]`, into `out[k]` (each owned by the caller): the
 /// stages run once over every state's block, attention per state against its own window of committed main rows, and
 /// the Markov chain steps every state's row at once. `keep_logits` also copies the Markov-biased rows to the host.
-pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, t1s: []const u32, keep_logits: bool, out: []DsparkDraft) !void {
+pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, t1s: []const u32, keep_logits: bool, out: []DsparkDraft, verify: ?DraftLead) !void {
     if (states.len > region_rows) return error.Dsv41BatchUnsupported;
     m.dropNextDraft();
     m.dropLead();
+    // The step before this round may already have begun the verify's first rows (`leadBatched`): they stand.
+    if (!(if (verify) |v| v.stands(m) else false)) m.dropGroupLead();
+    // So may this round's draft have run since that step ended (`dsparkDraftAheadBatched`).
+    var ahead: ?GroupAhead = m.group_draft;
+    m.group_draft = null;
+    defer if (ahead) |*a| a.deinit();
+    var rows: [region_rows]usize = undefined;
+    // A state is known by its identity, which the round's verify names (`DraftLead`).
+    var sgens: [region_rows]u64 = undefined;
+    var named = verify != null;
+    if (verify) |v| for (states, sgens[0..states.len]) |st, *g| {
+        const k = std.mem.indexOfScalar(*State, v.states, st) orelse {
+            named = false;
+            break;
+        };
+        g.* = v.gens[k];
+    };
+    if (ahead) |*a| if (keep_logits or !named or !chains(m) or !a.standsFor(states, sgens[0..states.len], t1s, rows[0..states.len])) {
+        a.deinit();
+        ahead = null;
+        m.ds_group_draft_lost += 1;
+    };
+    // The draft's time, for the round's pricing: one launched behind the last step has run since that step's verdict
+    // was read (`verdictRead`), not since this call.
+    m.ds_draft_us = monoUs();
+    defer m.ds_draft_ns = @intCast(@max(monoUs() - m.ds_draft_us, 0) * 1000);
+    if (ahead) |*a| {
+        m.ds_chained += 1;
+        m.ds_draft_us = @min(m.ds_draft_us, m.ds_verdict_us);
+        if (verify) |v| if (m.group_lead == null) try v.launch(m, gpa, a.ev[0]);
+        try evalAll(&a.ev);
+        try draftBatchedRead(m, gpa, &a.ev, a.want_conf, false, t1s, rows[0..states.len], out);
+        if (verify != null) engramAheadBatched(m, states, out[0..states.len]);
+        return;
+    }
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
+    const g = try draftBatchedGraph(&sc, m, states, .{ .host = t1s }, null, keep_logits);
+    var ev = g.ev;
+    // The draft goes to the GPU as its own batch, then the verify's first rows behind it: the host reads the draft
+    // and prices its rows while they run.
+    try asyncEvalAll(&ev);
+    if (verify) |v| if (m.group_lead == null) try v.launch(m, gpa, ev[0]);
+    try evalAll(&ev);
+    for (rows[0..states.len], 0..) |*r, k| r.* = k;
+    try draftBatchedRead(m, gpa, &ev, g.want_conf, keep_logits, t1s, rows[0..states.len], out);
+    if (verify != null) engramAheadBatched(m, states, out[0..states.len]);
+}
+
+/// A greedy verdict on rows [lo, lo + chunk.len) of a batched verify's tokens `am` (`[R]` int32, every row's own
+/// token), for `chunk` = `[t1, drafts…]`: the drafts kept, at most `cap`, and the token after them, both still the
+/// GPU's (caller frees both).
+pub fn greedyVerdictRows(m: *const Dsv41Model, gpa: std.mem.Allocator, am: A, lo: usize, chunk: []const u32, cap: usize) !LazyVerdict {
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const v = try greedyVerdict(&sc, try sc.slice(am, 0, lo, lo + chunk.len), chunk[1..], cap);
+    return .{ .kept = sc.out(v.kept), .next = sc.out(v.next) };
+}
+
+/// Whether the batched verify in hand can take the next round's draft behind it for `st` (`dsparkDraftAheadVerify`):
+/// its main rows are held and every stage's window is full whatever the verdict keeps.
+pub fn aheadFitsVerify(m: *const Dsv41Model, st: *const State) bool {
+    const v = &(st.verify orelse return false);
+    return chains(m) and v.mh.ctx != null and v.kv.len == 0 and v.n0 >= m.cfg.sliding_window and st.ds.len == m.n_mtp;
+}
+
+/// The next round's draft of `states` handed to the GPU behind the batched verify in hand, from each state's verdict
+/// while it is still the GPU's (`verdicts[k]`: the drafts kept, an int32 scalar, and the token after them, `[1]`
+/// int32): the stages run on whichever rows each verdict keeps (`dsparkDraftAhead`, a state a block). `finishVerify`
+/// keeps the window rows the draft read; `dsparkDraftBatched` reads the draft for the states whose round committed
+/// the same verdict. A no-op unless every state fits (`aheadFitsVerify`).
+pub fn dsparkDraftAheadVerify(m: *Dsv41Model, states: []const *State, gens: []const u64, verdicts: []const LazyVerdict) !void {
+    m.dropGroupDraft();
+    const N = states.len;
+    if (N == 0 or N > dkern.max_rows or gens.len != N or verdicts.len != N or m.ds_block >= 16) return;
+    for (states, 0..) |st, k| {
+        if (!aheadFitsVerify(m, st)) return;
+        for (states[0..k]) |o| if (o == st) return;
+    }
+    const W: usize = m.cfg.sliding_window;
+    var sc = Scope.init(states[0].gpa, m.s);
+    errdefer sc.deinit();
+    // The verdicts are their own batch: a wait on them ends with the verify, not with the draft behind it.
+    var nexts: [dkern.max_rows]A = undefined;
+    var kepts: [dkern.max_rows]A = undefined;
+    for (verdicts, nexts[0..N], kepts[0..N]) |v, *t, *kp| {
+        t.* = try sc.reshape(v.next, &.{1});
+        kp.* = try sc.reshape(v.kept, &.{1});
+    }
+    const toks = try sc.concat(nexts[0..N], 0);
+    const kept = try sc.concat(kepts[0..N], 0);
+    try asyncEvalAll(&.{ toks, kept });
+    var from: [dkern.max_rows]DraftFrom = undefined;
+    // Each state's window rows for every row of its chunk, kept for `finishVerify` once the draft is launched.
+    var kvs: [dkern.max_rows][]A = undefined;
+    var made: usize = 0;
+    errdefer for (kvs[0..made], states[0..made]) |kv, st| {
+        for (kv) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+        st.gpa.free(kv);
+    };
+    for (states, verdicts, 0..) |st, vd, k| {
+        const v = &st.verify.?;
+        // Row j of [the window before the chunk, the chunk's rows] is position n0 - W + j.
+        const rows = try sc.add(vd.kept, try sc.i(1));
+        const idx = try sc.add(rows, try sc.arange(0, W));
+        from[k] = .{ .t1 = vd.next, .pos = try sc.add(rows, try sc.i(ci(v.n0))) };
+        const main_x = try mainX(&sc, m, v.mh);
+        const kv = try st.gpa.alloc(A, st.ds.len);
+        @memset(kv, none);
+        kvs[k] = kv;
+        made += 1;
+        for (st.ds, kv, 0..) |*ring, *slot, si| {
+            const all = try sc.astype(try mainKv(&sc, m, main_x, si, v.n0), mlx.mlx_array_dtype(ring.buf));
+            slot.* = sc.out(all);
+            from[k].keys[si] = try sc.take(try sc.concat(&.{ try ring.read(&sc, v.n0 - W, v.n0), all }, 0), idx, 0);
+        }
+    }
+    const g = try draftBatchedGraph(&sc, m, states, .{ .gpu = toks }, from[0..N], false);
+    try asyncEvalAll(&g.ev);
+    var ahead: GroupAhead = .{ .sc = sc, .ev = g.ev, .want_conf = g.want_conf, .toks = ref(toks), .n = N, .kept = ref(kept) };
+    for (states, gens, 0..) |st, gen, k| {
+        st.verify.?.kv = kvs[k];
+        ahead.gens[k] = gen;
+        ahead.p0s[k] = st.verify.?.n0;
+    }
+    m.group_draft = ahead;
+    m.ds_launched += 1;
+}
+
+/// The Engram rows of the verify a batched draft is followed by, read now into the LRU: each state's first draft rows
+/// (as many as one early read holds over all the states), whichever of them the round then buys. The verify's lead
+/// runs for about the time a read begun where the verify is built would take. The histories are not touched.
+fn engramAheadBatched(m: *const Dsv41Model, states: []const *State, drafts: []const DsparkDraft) void {
+    if (m.pair != null or m.engrams.len == 0 or states.len == 0) return;
+    const hs = &(m.hash orelse return);
+    const nc = hs.cols();
+    if (hs.n_layers != m.engrams.len or nc == 0) return;
+    const per = @min(m.ds_block, edec.max_early / (states.len * nc), VERIFY_MAX_DRAFTS);
+    if (per == 0) return;
+    var comp: [VERIFY_MAX_DRAFTS + 1]u32 = undefined;
+    var all: [(VERIFY_MAX_DRAFTS + 1) * engram.MAX_LAYERS * engram.MAX_COLS]u32 = undefined;
+    var mine: [engram.MAX_LAYERS][edec.max_early]u32 = undefined;
+    var n: usize = 0;
+    for (states, drafts) |st, d| {
+        if (d.ids.len < per + 1) return;
+        for (d.ids[0 .. per + 1], comp[0 .. per + 1]) |t, *o| o.* = m.compressedId(t, false);
+        hs.rows(st.hist.items, comp[0 .. per + 1], all[0 .. (per + 1) * hs.n_layers * nc]);
+        // Row 0 is the committed token's, read when the lead was launched.
+        for (1..per + 1) |t| {
+            for (0..m.engrams.len) |ek| @memcpy(mine[ek][n * nc ..][0..nc], all[(t * hs.n_layers + ek) * nc ..][0..nc]);
+            n += 1;
+        }
+    }
+    for (m.engrams, 0..) |*e, ek| e.table.readEarly(ek, mine[ek][0 .. n * nc]);
+}
+
+/// The tokens a batched draft starts from, a state each: the host's, or a step's draws still the GPU's (`[N]` int32).
+const BatchT1 = union(enum) { host: []const u32, gpu: A };
+
+/// `dsparkDraftBatched`'s graph (its arrays `sc`'s): every state's ids `[N, B]`, the confidences `[N, B]` (the ids
+/// again without them) and the rows `keep_logits` reads (the ids again otherwise).
+fn draftBatchedGraph(sc: *Scope, m: *Dsv41Model, states: []const *State, t1: BatchT1, picked: ?[]const DraftFrom, keep_logits: bool) !DraftGraph {
+    const gpa = sc.a;
     const c = &m.cfg;
     const B = m.ds_block;
     const N = states.len;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
     const ds = &m.dspark.?;
-    const ids = try gpa.alloc(i32, N * B);
-    defer gpa.free(ids);
-    for (t1s, 0..) |t1, k| for (0..B) |j| {
-        ids[k * B + j] = @intCast(if (j == 0) t1 else c.dsv4_dspark_noise_token_id);
+    var cur: A = undefined;
+    const emb = switch (t1) {
+        .host => |t1s| blk: {
+            // the rows by their host ids.
+            const uids = try gpa.alloc(u32, N * B);
+            defer gpa.free(uids);
+            for (t1s, 0..) |t, k| for (0..B) |j| {
+                uids[k * B + j] = if (j == 0) t else c.dsv4_dspark_noise_token_id;
+            };
+            const firsts = try gpa.alloc(i32, N);
+            defer gpa.free(firsts);
+            for (firsts, t1s) |*f, t| f.* = @intCast(t);
+            cur = try sc.ints(firsts, &.{ci(N)});
+            break :blk try embedIds(m, sc, uids, m.act);
+        },
+        .gpu => |t| blk: {
+            cur = t;
+            const first = try sc.reshape(t, &.{ ci(N), 1 });
+            const ids = if (B == 1) first else try sc.concat(&.{ first, try sc.broadcast(try sc.i(@intCast(c.dsv4_dspark_noise_token_id)), &.{ ci(N), ci(B - 1) }) }, 1);
+            break :blk try m.embed.rows(sc, try sc.reshape(ids, &.{ci(N * B)}), m.act);
+        },
     };
-    // the rows by their host ids.
-    const uids = try gpa.alloc(u32, N * B);
-    defer gpa.free(uids);
-    for (uids, ids) |*u, v| u.* = @intCast(v);
-    const emb = try embedIds(m, &sc, uids, m.act);
     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(N * B), ci(hc), ci(d) });
-    var pre = try onehotPre(&sc, m, N * B);
+    var pre = try onehotPre(sc, m, N * B);
     var wins: [region_rows]StageWin = undefined;
     for (0..m.n_mtp) |si| {
-        for (states, wins[0..N]) |st, *w| w.* = try stageWin(&sc, m, st, si);
-        x = try stageBlock(&sc, m, wins[0..N], m.n_layers + si, x, &pre, B);
+        // Each state's window and position: its own, or what its verify's verdict picks on the GPU (`picked`).
+        for (states, wins[0..N], 0..) |st, *w, k| w.* = if (picked) |f| .{ .keys = f[k].keys[si], .pos = f[k].pos } else try stageWin(sc, m, st, si);
+        x = try stageBlock(sc, m, wins[0..N], m.n_layers + si, x, &pre, B);
         // handed over as built (`draftGraph`).
         if (si + 1 < m.n_mtp) try asyncEvalAll(&.{ x, pre });
     }
-    const flat = try hcCollapse(&sc, x, pre);
+    const flat = try hcCollapse(sc, x, pre);
     const hout = try sc.reshape(flat, &.{ ci(N), ci(B), ci(d) });
-    const logits = try sc.reshape(try sc.astype(try m.draftHead().apply(&sc, try sc.rms(flat, ds.norm, c.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
-    const firsts = try gpa.alloc(i32, N);
-    defer gpa.free(firsts);
-    for (firsts, t1s) |*f, t| f.* = @intCast(t);
-    var cur = try sc.ints(firsts, &.{ci(N)});
+    const logits = try sc.reshape(try sc.astype(try m.draftHead().apply(sc, try sc.rms(flat, ds.norm, c.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
     const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
     var toks: [16]A = undefined;
     var confs: [16]A = undefined;
@@ -7582,14 +8133,21 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
     }
     const all = try sc.stack(toks[0..B], 1); // [N, B]
     const rows_all = if (keep_logits) try sc.stack(rows_k[0..B], 1) else all;
-    var ev = [_]A{ all, if (want_conf) try sc.astype(try sc.concat(confs[0..B], -1), .float32) else all, rows_all };
-    try evalAll(&ev);
+    return .{ .ev = .{ all, if (want_conf) try sc.astype(try sc.concat(confs[0..B], -1), .float32) else all, rows_all }, .want_conf = want_conf };
+}
+
+/// A batched draft's evaluated outputs `ev` (`draftBatchedGraph`'s) read for the states at its rows `rows`: `out[k]`
+/// is the draft of row `rows[k]` from its token `t1s[k]`, owned by the caller.
+fn draftBatchedRead(m: *const Dsv41Model, gpa: std.mem.Allocator, ev: []const A, want_conf: bool, keep_logits: bool, t1s: []const u32, rows: []const usize, out: []DsparkDraft) !void {
+    const B = m.ds_block;
+    const all = ev[0];
+    const total = dim(all, 0);
     const data = mlx.mlx_array_data_int32(all) orelse return error.NoData;
-    const conf_data: []const f32 = if (want_conf) (mlx.mlx_array_data_float32(ev[1]) orelse return error.NoData)[0 .. N * B] else &.{};
-    const logit_data: []const f32 = if (keep_logits) (mlx.mlx_array_data_float32(rows_all) orelse return error.NoData)[0 .. N * B * m.vocab] else &.{};
+    const conf_data: []const f32 = if (want_conf) (mlx.mlx_array_data_float32(ev[1]) orelse return error.NoData)[0 .. total * B] else &.{};
+    const logit_data: []const f32 = if (keep_logits) (mlx.mlx_array_data_float32(ev[2]) orelse return error.NoData)[0 .. total * B * m.vocab] else &.{};
     var made: usize = 0;
     errdefer for (out[0..made]) |*o| o.deinit(gpa);
-    for (out[0..N], t1s, 0..) |*o, t1, k| {
+    for (out[0..rows.len], t1s, rows) |*o, t1, k| {
         const out_ids = try gpa.alloc(u32, B + 1);
         errdefer gpa.free(out_ids);
         out_ids[0] = t1;
@@ -7611,6 +8169,77 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
         o.* = .{ .ids = out_ids, .len = len, .logits = host_logits, .confidence = conf };
         made += 1;
     }
+}
+
+/// The next round's batched draft, handed to the GPU behind the plain step whose draws are its tokens
+/// (`dsparkDraftAheadBatched`): the stages start when that step ends, not after the host has read its draws and come
+/// round to drafting. `dsparkDraftBatched` reads it for the states it drafted, at their positions, from those tokens.
+const GroupAhead = struct {
+    sc: Scope,
+    ev: [3]A,
+    want_conf: bool,
+    /// The tokens it drafts from (`[n]` int32), the host's once it has read the step's draws.
+    toks: A,
+    n: usize,
+    gens: [dkern.max_rows]u64 = undefined,
+    /// Where each state stood when it was launched: after a plain step, its position; behind a verify, the verify's
+    /// first position, the draft's then `kept[k] + 1` further (`kept`: `[n]` int32, the GPU's verdicts).
+    p0s: [dkern.max_rows]usize = undefined,
+    kept: A = none,
+
+    fn deinit(self: *GroupAhead) void {
+        _ = mlx.mlx_array_free(self.toks);
+        if (self.kept.ctx != null) _ = mlx.mlx_array_free(self.kept);
+        self.sc.deinit();
+    }
+
+    /// Whether every one of `states` (identities `gens`, drafting from `t1s`) has its draft here; `rows[k]` is then
+    /// its row.
+    fn standsFor(self: *const GroupAhead, states: []const *State, gens: []const u64, t1s: []const u32, rows: []usize) bool {
+        if (states.len == 0 or states.len > self.n or t1s.len != states.len or gens.len != states.len) return false;
+        // The tokens and verdicts were a batch of their own behind a step the host has read since: the wait ends at
+        // once, and a draft is never judged by a buffer the GPU has not written.
+        if (mlx.mlx_array_eval(self.toks) != 0) return false;
+        if (self.kept.ctx != null and mlx.mlx_array_eval(self.kept) != 0) return false;
+        const toks = mlx.mlx_array_data_int32(self.toks) orelse return false;
+        const kept: ?[*]const i32 = if (self.kept.ctx != null) mlx.mlx_array_data_int32(self.kept) orelse return false else null;
+        for (states, gens, t1s, rows) |st, gen, t1, *r| {
+            const k = std.mem.indexOfScalar(u64, self.gens[0..self.n], gen) orelse return false;
+            const at: i64 = @as(i64, @intCast(self.p0s[k])) + if (kept) |kp| @as(i64, kp[k]) + 1 else 0;
+            if (at != @as(i64, @intCast(st.n)) or st.verify != null or @as(i64, toks[k]) != @as(i64, t1)) return false;
+            r.* = k;
+        }
+        return true;
+    }
+};
+
+/// The next round's draft of `states` handed to the GPU behind the plain step in hand: `draws` (`[n]`, any integer
+/// type) are that step's sampled tokens for these states, which the host has not read. The step has already moved
+/// each state and its stages' windows, so the draft is the one `dsparkDraftBatched` builds once the host holds the
+/// tokens. A no-op where rounds do not chain.
+pub fn dsparkDraftAheadBatched(m: *Dsv41Model, states: []const *State, gens: []const u64, draws: A) !void {
+    m.dropGroupDraft();
+    const N = states.len;
+    if (!chains(m) or N == 0 or N > dkern.max_rows or gens.len != N or mlx.mlx_array_size(draws) != N or m.ds_block >= 16) return;
+    for (states, 0..) |st, k| {
+        if (st.verify != null or st.ds.len != m.n_mtp) return;
+        for (states[0..k]) |o| if (o == st) return;
+    }
+    // The graph's arrays outlive this call: the first state's allocator holds their list.
+    var sc = Scope.init(states[0].gpa, m.s);
+    errdefer sc.deinit();
+    const toks = try sc.astype(try sc.reshape(draws, &.{ci(N)}), .int32);
+    // The draws are their own batch: a wait on them ends with the step, not with the draft behind it.
+    try asyncEvalAll(&.{ draws, toks });
+    const g = try draftBatchedGraph(&sc, m, states, .{ .gpu = toks }, null, false);
+    try asyncEvalAll(&g.ev);
+    var ahead: GroupAhead = .{ .sc = sc, .ev = g.ev, .want_conf = g.want_conf, .toks = ref(toks), .n = N };
+    for (states, gens, 0..) |st, gen, k| {
+        ahead.gens[k] = gen;
+        ahead.p0s[k] = st.n;
+    }
+    m.group_draft = ahead;
+    m.ds_launched += 1;
 }
 
 /// A state's side of one DSpark stage: its window of committed main rows and its block's first position (an int32
@@ -10153,7 +10782,7 @@ test "dsv41 group: greedy DSpark group rounds against batched plain steps, by st
         for (0..rounds + warm) |r| {
             var drafts: [max_n]DsparkDraft = undefined;
             const t0 = iou.nowUsMonotonic(io);
-            try dsparkDraftBatched(m, gpa, ptrs[0..n], t1s[0..n], false, drafts[0..n]);
+            try dsparkDraftBatched(m, gpa, ptrs[0..n], t1s[0..n], false, drafts[0..n], null);
             defer for (drafts[0..n]) |*d| d.deinit(gpa);
             const t_d = iou.nowUsMonotonic(io);
             var chunks: [max_n][]const u32 = undefined;
@@ -10191,6 +10820,137 @@ test "dsv41 group: greedy DSpark group rounds against batched plain steps, by st
             @as(f64, @floatFromInt(us[2])) / rounds / 1000,               @as(f64, @floatFromInt(tokens)) / rounds / @as(f64, @floatFromInt(n)),
             @as(f64, @floatFromInt(tokens)) * 1000 / rounds / round_ms,
         });
+    }
+}
+
+test "dsv41 group lead: batched steps and verifies behind a lead against the ones built whole, on a pack (DSV41_GROUP_LEAD)" {
+    // DSV41_GROUP_LEAD = a pack dir. Three sets of states read the same prompts and step the same tokens. `led` takes
+    // the layers begun behind the step before (`leadBatched`, `leadBatchedOn`: the pack's Engram layer among them);
+    // `plain` builds every step whole; `apart` is what the closing verify is measured by.
+    // 1. A plain step behind a lead is the step: the same launches at the same widths, its logits bit for bit, and so
+    //    is every step after a verify built whole.
+    // 2. A verify behind a lead runs each state's first row apart from its further rows. Its rows are as far from the
+    //    whole verify's as the same rows stepped one after the other are (two whole builds of one verify): on
+    //    DeepSeek-V4.1-Flash a further row's logits moved 0.91 at most (rms 0.19) behind a lead and 1.09 (rms 0.20)
+    //    stepped apart, of a largest magnitude of 21; the first rows were the whole verify's bits.
+    const dir = std.mem.span(std.c.getenv("DSV41_GROUP_LEAD") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
+    defer w.deinit();
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = true });
+    defer m.deinit();
+    const n = 4;
+    try testing.expect(leadsBatched(m, n));
+    var sets: [3][n]State = undefined; // led, plain, apart
+    var ptrs: [3][n]*State = undefined;
+    var t1s: [n]u32 = undefined;
+    for (0..n) |k| {
+        var prompt: [300]u32 = undefined;
+        for (&prompt, 0..) |*t, i| t.* = @intCast((i * 7919 + 13 + k * 104729) % @min(m.vocab, 100000));
+        for (&sets, &ptrs) |*set, *p| {
+            set[k] = try initState(m, gpa);
+            p[k] = &set[k];
+            const l = try meterPrefill(m, gpa, &set[k], &prompt);
+            defer _ = mlx.mlx_array_free(l);
+            t1s[k] = try argmaxHost(l);
+        }
+    }
+    defer for (&sets) |*set| for (set) |*st| st.deinit();
+    const gens = [3][n]u64{ .{ 1, 2, 3, 4 }, .{ 11, 12, 13, 14 }, .{ 21, 22, 23, 24 } };
+    const rounds = 20;
+    for (0..rounds + 1) |r| {
+        // Every fourth round is a verify: one further row for the even states (any token: the rows' logits are
+        // compared, not what a draft is worth), six rows in all, the fused kernels' own width. The last round is the
+        // verify behind a lead; the others are built whole, the lead begun for them let go.
+        const last = r == rounds;
+        const verify = r % 4 == 3 or last;
+        var toks: [n][2]u32 = undefined;
+        var chunks: [n][]const u32 = undefined;
+        var firsts: [n][]const u32 = undefined;
+        var offs: [n]usize = undefined;
+        var rows: usize = 0;
+        for (0..n) |k| {
+            toks[k] = .{ t1s[k], (t1s[k] * 31 + 7) % @min(m.vocab, 100000) };
+            chunks[k] = toks[k][0 .. if (verify and k % 2 == 0) @as(usize, 2) else 1];
+            firsts[k] = toks[k][0..1];
+            offs[k] = rows;
+            rows += chunks[k].len;
+        }
+        if (verify and !last) m.dropGroupLead();
+        const led0 = m.ds_group_led;
+        const got = try extendBatched(m, gpa, &ptrs[0], &gens[0], &chunks, verify);
+        defer _ = mlx.mlx_array_free(got);
+        try testing.expectEqual(led0 + @intFromBool(r > 0 and (!verify or last)), m.ds_group_led);
+        const want = try extendBatched(m, gpa, &ptrs[1], &gens[1], &chunks, verify);
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_array_eval(got));
+        try mlx.check(mlx.mlx_array_eval(want));
+        const x = (mlx.mlx_array_data_float32(got) orelse return error.NoData)[0..mlx.mlx_array_size(got)];
+        const y = (mlx.mlx_array_data_float32(want) orelse return error.NoData)[0..mlx.mlx_array_size(want)];
+        if (!last) {
+            try testing.expectEqualSlices(f32, y, x);
+            // `apart` keeps step with the others.
+            const same = try extendBatched(m, gpa, &ptrs[2], &gens[2], &chunks, verify);
+            _ = mlx.mlx_array_free(same);
+            for (0..n) |k| {
+                var best: usize = 0;
+                for (y[offs[k] * m.vocab ..][0..m.vocab], 0..) |v, i| {
+                    if (v > y[offs[k] * m.vocab + best]) best = i;
+                }
+                t1s[k] = @intCast(best);
+            }
+            // A verify keeps its first row alone, so every set stands where a plain step would have left it.
+            if (verify) for (&sets) |*set| for (set) |*st| try finishVerify(m, gpa, st, 1);
+            // The next step's first layers behind this one, as a round launches them: before the tokens are read,
+            // then on through the Engram layer once they are.
+            const draws = mlx.mlx_array_new_data(&t1s, &[_]c_int{n}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(draws);
+            try leadBatched(m, gpa, &ptrs[0], &gens[0], draws);
+            try leadBatchedOn(m, gpa, &ptrs[0], &gens[0], &t1s);
+            try testing.expectEqual(leadLayersOn(m), m.group_lead.?.hi);
+            continue;
+        }
+        // The same rows stepped one after the other, each committed: another whole build of this verify.
+        const a1 = try extendBatched(m, gpa, &ptrs[2], &gens[2], &firsts, false);
+        defer _ = mlx.mlx_array_free(a1);
+        var two = [2]*State{ ptrs[2][0], ptrs[2][2] };
+        const b1 = try extendBatched(m, gpa, &two, &.{ gens[2][0], gens[2][2] }, &.{ chunks[0][1..2], chunks[2][1..2] }, false);
+        defer _ = mlx.mlx_array_free(b1);
+        try mlx.check(mlx.mlx_array_eval(a1));
+        try mlx.check(mlx.mlx_array_eval(b1));
+        const xa = (mlx.mlx_array_data_float32(a1) orelse return error.NoData)[0 .. n * m.vocab];
+        const xb = (mlx.mlx_array_data_float32(b1) orelse return error.NoData)[0 .. 2 * m.vocab];
+        var big: f32 = 0;
+        for (y) |b| big = @max(big, @abs(b));
+        // [behind a lead, stepped apart] x [first rows, further rows]: the largest gap and the squared sum.
+        var most: [2][2]f32 = @splat(@splat(0));
+        var sq: [2][2]f64 = @splat(@splat(0));
+        for (0..n) |k| for (0..m.vocab) |v| {
+            const ref_v = y[offs[k] * m.vocab + v];
+            for ([_]f32{ @abs(x[offs[k] * m.vocab + v] - ref_v), @abs(xa[k * m.vocab + v] - ref_v) }, 0..) |d, which| {
+                most[which][0] = @max(most[which][0], d);
+                sq[which][0] += @as(f64, d) * d;
+            }
+        };
+        for ([_]usize{ 0, 2 }, 0..) |k, j| for (0..m.vocab) |v| {
+            const ref_v = y[(offs[k] + 1) * m.vocab + v];
+            for ([_]f32{ @abs(x[(offs[k] + 1) * m.vocab + v] - ref_v), @abs(xb[j * m.vocab + v] - ref_v) }, 0..) |d, which| {
+                most[which][1] = @max(most[which][1], d);
+                sq[which][1] += @as(f64, d) * d;
+            }
+        };
+        const nv: f64 = @floatFromInt(m.vocab);
+        const rms = [2][2]f64{ .{ @sqrt(sq[0][0] / (n * nv)), @sqrt(sq[0][1] / (2 * nv)) }, .{ @sqrt(sq[1][0] / (n * nv)), @sqrt(sq[1][1] / (2 * nv)) } };
+        std.debug.print("dsv41 group lead on {s}: {d} rounds of {d} states bit-equal behind leads through layer {d} (Engram layers at", .{ dir, rounds, n, leadLayersOn(m) });
+        for (m.engrams) |e| std.debug.print(" {d}", .{e.layer});
+        std.debug.print("); the closing verify against the whole one, of a largest magnitude {d:.2}:\n  behind a lead: first rows max {d:.4} rms {d:.4}, further rows max {d:.4} rms {d:.4}\n  stepped one after the other: first rows max {d:.4} rms {d:.4}, further rows max {d:.4} rms {d:.4}\n", .{ big, most[0][0], rms[0][0], most[0][1], rms[0][1], most[1][0], rms[1][0], most[1][1], rms[1][1] });
+        // No farther from the whole verify than three times what stepping the rows apart is, row kind by row kind
+        // (a first row no farther than a further row stepped apart).
+        try testing.expect(rms[0][1] <= 3 * rms[1][1] and most[0][1] <= 3 * most[1][1]);
+        try testing.expect(rms[0][0] <= 3 * @max(rms[1][0], rms[1][1]) and most[0][0] <= 3 * @max(most[1][0], most[1][1]));
+        for (&sets[0..2].*) |*set| for (set) |*st| try finishVerify(m, gpa, st, 1);
     }
 }
 
