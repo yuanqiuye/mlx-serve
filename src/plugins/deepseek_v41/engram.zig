@@ -311,6 +311,16 @@ pub const Table = struct {
         edir.map(self.fd);
     }
 
+    /// The mapped file's bytes, 0 for a table whose rows are not copies out of a map.
+    pub fn mapBytes(self: *const Table) u64 {
+        return if (self.mapsRows()) fileSize(self.fd) else 0;
+    }
+
+    /// The mapped file read into the page cache behind whatever else reads it (`edir.warm`).
+    pub fn warm(self: *const Table) void {
+        if (self.mapsRows()) edir.warm(self.fd);
+    }
+
     /// The mapped file's rows so far (`edir.Counts`).
     pub fn mapCounts(self: *const Table) edir.Counts {
         return edir.counts(self.fd);

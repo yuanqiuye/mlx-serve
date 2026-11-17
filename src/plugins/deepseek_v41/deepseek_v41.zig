@@ -1912,7 +1912,24 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     if (m.attn_gather != null) try warmRing(m);
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages{s}{s}\n", .{ n_layers, m.engrams.len, n_stages, if (opts.quant != null) ", weights on " else "", if (opts.quant) |q| q.name() else "" });
     if (m.dec.moe_fp4 != null) log.info("deepseek_v41: fused mxfp4 MoE decode kernels on\n", .{});
+    if (!worker and !tp_worker) warmEngram(m);
     return m;
+}
+
+/// The mapped Engram tables read into the page cache now that the weights are loaded (`engram.Table.warm`), when
+/// the memory that is free or reclaimable holds them whole: a table the cache cannot hold is read for nothing.
+fn warmEngram(m: *const Dsv41Model) void {
+    if (env.get(.MLX_SERVE_DSV41_ENGRAM_WARM)) |v| if (v[0] == '0') return;
+    var bytes: u64 = 0;
+    for (m.engrams) |*e| bytes += e.table.mapBytes();
+    if (bytes == 0) return;
+    const room = system.getAvailableMemBytes();
+    if (room < bytes) {
+        log.info("deepseek_v41: Engram tables left to the prompts that read them: {d} GiB of tables, {d} GiB free or reclaimable\n", .{ bytes >> 30, room >> 30 });
+        return;
+    }
+    for (m.engrams) |*e| e.table.warm();
+    log.info("deepseek_v41: Engram tables ({d} GiB) are read into the page cache behind the load ({d} GiB free or reclaimable; MLX_SERVE_DSV41_ENGRAM_WARM=0 leaves it to the prompts)\n", .{ bytes >> 30, room >> 30 });
 }
 
 /// the gemv twin's served launches (gemv_twin.zig `served`) for the indexer's plain

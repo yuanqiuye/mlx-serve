@@ -53,6 +53,8 @@ const Map = struct {
     /// log2 of the page size.
     shift: u6 = 14,
     ctl: ?*Ctl = null,
+    /// The read of the whole file into the page cache, once asked for (`warm`).
+    warming: ?*Warm = null,
 
     const in_cache: u8 = 1;
     const touched: u8 = 2;
@@ -266,6 +268,112 @@ fn waitRefresh(ctl: *const Ctl) void {
     if (comptime !builtin.os.tag.isDarwin()) return;
     while (ctl.refreshing.load(.acquire)) _ = usleep(1000);
 }
+/// A mapped file read into the page cache from end to end (`warm`): a model's load pushes its tables out of the
+/// cache, and until a prompt has read a row's page that row is a pread (586,000 a second on one file whatever the
+/// threads, where copies out of held pages run at millions). The pages are the page cache's: the system takes
+/// them back when it wants the memory, and while rows are still read by pread the pages it took are read again
+/// (`again`), at longer and longer intervals while they keep going (`strikes`: the cache is not holding the file).
+const Warm = struct {
+    stop: std.atomic.Value(bool) = .init(false),
+    /// A pass in flight; its thread, joined by the next pass or the unmap.
+    running: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+    /// Passes ended, the bytes they read (pages the page cache held are not read), and when the last one ended.
+    passes: std.atomic.Value(u32) = .init(0),
+    read: std.atomic.Value(u64) = .init(0),
+    ended_ns: std.atomic.Value(u64) = .init(0),
+    /// Passes in a row after the first that found a quarter of the file gone again.
+    strikes: std.atomic.Value(u32) = .init(0),
+
+    /// Readers a file (an SSD serves several streams faster than one) and the bytes of one read: short enough that
+    /// a prompt's own preads of the file, which run one after another with these, wait a fraction of a millisecond.
+    const readers = 4;
+    const chunk: usize = if (builtin.is_test) 4096 else 1 << 20;
+    /// The least time between two passes, four times longer a strike (20 s to 21 min).
+    const again_ns: u64 = if (builtin.is_test) 0 else 20 * std.time.ns_per_s;
+    const max_strikes = 3;
+
+    /// A pass on a thread of its own, unless one is in flight.
+    fn start(w: *Warm, m: Map) void {
+        if (w.running.swap(true, .acq_rel)) return;
+        if (w.thread) |t| t.join();
+        w.thread = std.Thread.spawn(.{}, run, .{ m, w }) catch null;
+        if (w.thread == null) w.running.store(false, .release);
+    }
+
+    /// A pread found a page gone: another pass, once the last is `again_ns` old.
+    fn again(w: *Warm, m: *const Map) void {
+        if (w.running.load(.monotonic) or w.passes.load(.monotonic) == 0) return;
+        if (nowNs() -% w.ended_ns.load(.monotonic) < again_ns << @intCast(2 * w.strikes.load(.monotonic))) return;
+        w.start(m.*);
+    }
+
+    fn run(m: Map, w: *Warm) void {
+        // What the page cache holds now, not when the file was mapped.
+        refresh(&m);
+        waitRefresh(m.ctl.?);
+        const before = w.read.load(.monotonic);
+        var threads: [readers]?std.Thread = @splat(null);
+        for (threads[1..], 1..) |*t, k| t.* = std.Thread.spawn(.{}, part, .{ m, w, k }) catch null;
+        part(m, w, 0);
+        for (threads[1..], 1..) |t, k| {
+            if (t) |th| th.join() else part(m, w, k);
+        }
+        // A pass after the first that reads a quarter of the file again: the next one waits longer.
+        if (w.passes.load(.monotonic) > 0) {
+            const lost = w.read.load(.monotonic) - before > m.len / 4;
+            w.strikes.store(if (lost) @min(w.strikes.load(.monotonic) + 1, max_strikes) else 0, .monotonic);
+        }
+        w.ended_ns.store(nowNs(), .monotonic);
+        _ = w.passes.fetchAdd(1, .release);
+        w.running.store(false, .release);
+    }
+
+    fn part(m: Map, w: *Warm, k: usize) void {
+        const buf = std.heap.page_allocator.alloc(u8, chunk) catch return;
+        defer std.heap.page_allocator.free(buf);
+        const pages = m.held.len;
+        var at = (pages * k / readers) << m.shift;
+        const end = @min(m.len, (pages * (k + 1) / readers) << m.shift);
+        while (at < end and !w.stop.load(.acquire)) {
+            const n = @min(chunk, end - at);
+            defer at += n;
+            const lo = at >> m.shift;
+            const hi = (at + n - 1) >> m.shift;
+            var held = true;
+            for (m.held[lo .. hi + 1]) |*h| held = held and @atomicLoad(u8, h, .monotonic) & Map.in_cache != 0;
+            if (held) continue;
+            if (std.c.pread(m.fd, buf.ptr, n, @intCast(at)) != @as(isize, @intCast(n))) return;
+            // The pread left its pages in the page cache.
+            for (m.held[lo .. hi + 1]) |*h| {
+                const have = @atomicLoad(u8, h, .monotonic);
+                if (have & Map.in_cache == 0) @atomicStore(u8, h, have | Map.in_cache, .monotonic);
+            }
+            _ = w.read.fetchAdd(n, .monotonic);
+        }
+    }
+};
+
+/// A mapped file's pages read into the page cache on threads of their own, and read again where the system has
+/// taken them back while rows are still read (`Warm`); `unmap` ends it. A file not mapped is left alone.
+pub fn warm(fd: c_int) void {
+    if (comptime !builtin.os.tag.isDarwin()) return;
+    for (ps().maps[0..ps().n_maps]) |*m| if (m.fd == fd and m.warming == null) {
+        const w = std.heap.page_allocator.create(Warm) catch return;
+        w.* = .{};
+        m.warming = w;
+        w.start(m.*);
+    };
+}
+
+/// A warmed file's reads: the passes ended, the bytes read into the page cache so far, whether a pass is in flight
+/// and the passes in a row that found a quarter of the file gone again. Null for a file never warmed.
+pub fn warmed(fd: c_int) ?struct { passes: u32, bytes: u64, running: bool, strikes: u32 } {
+    const m = mapOf(fd) orelse return null;
+    const w = m.warming orelse return null;
+    return .{ .passes = w.passes.load(.acquire), .bytes = w.read.load(.monotonic), .running = w.running.load(.acquire), .strikes = w.strikes.load(.monotonic) };
+}
+
 pub const shared_state = @import("../../../sdk/util/shared.zig").Shared(State, "dsv41_engram_direct", .{});
 pub inline fn ps() *State {
     return shared_state.get();
@@ -332,6 +440,13 @@ pub fn unmap(fd: c_int) void {
     while (i < ps().n_maps) {
         if (ps().maps[i].fd == fd) {
             const m = ps().maps[i];
+            // The read-ahead reads the file and writes `held`: it ends first.
+            if (m.warming) |w| {
+                w.stop.store(true, .release);
+                while (w.running.load(.acquire)) _ = usleep(1000);
+                if (w.thread) |t| t.join();
+                std.heap.page_allocator.destroy(w);
+            }
             // A refresh in flight writes `held` and `answer` and reads the map's pages' state: it ends first.
             waitRefresh(m.ctl.?);
             std.posix.munmap(@alignCast(@constCast(m.base[0..m.len])));
@@ -422,6 +537,7 @@ pub fn readRow(fd: c_int, dst: []u8, off: u64) bool {
         // The pread left its pages in the page cache.
         m.mark(off, dst.len);
         if (m.ctl.?.miss()) refresh(m);
+        if (m.warming) |w| w.again(m);
         return true;
     };
     const block = blockOf(fd);
@@ -555,6 +671,86 @@ test "engram_direct map: a row is a pread until the page cache is known to hold 
     try std.testing.expectEqualSlices(u8, data[straddle..][0..256], &row);
     // Past the end: a short read either way.
     try std.testing.expect(!readRow(f.fd, &row, data.len - 100));
+}
+
+test "engram_direct map: a warmed file's rows are copies from the first read on, pages taken back are read again, and a close ends the read" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const page = std.heap.pageSize();
+    const data = try a.alloc(u8, 37 * page + 100);
+    defer a.free(data);
+    for (data, 0..) |*x, i| x.* = @truncate(i *% 29 +% (i >> 7));
+    const f = try testFile(a, "warm", data);
+    defer a.free(f.path);
+    defer _ = std.c.unlink(f.path);
+    defer _ = std.c.close(f.fd);
+    try std.testing.expect(warmed(f.fd) == null);
+    warm(f.fd); // not mapped: left alone
+    map(f.fd);
+    defer unmap(f.fd);
+    try std.testing.expect(warmed(f.fd) == null);
+    settle(f.fd);
+    // Nothing taken as held, as after a load that pushed the file out: every row would be a pread.
+    forget(f.fd);
+    try std.testing.expect(!holds(f.fd, 5 * page, 256));
+    warm(f.fd);
+    warm(f.fd); // once a map
+    while (warmed(f.fd).?.passes == 0) _ = usleep(1000);
+    settle(f.fd);
+    var row: [256]u8 = undefined;
+    for ([_]usize{ 40, 9 * page - 100, 18 * page + 7, 27 * page + 1, 37 * page - 200 }) |off| {
+        try std.testing.expect(holds(f.fd, off, 256));
+        try std.testing.expect(readRow(f.fd, &row, off));
+        try std.testing.expectEqualSlices(u8, data[off..][0..256], &row);
+    }
+    const c = counts(f.fd);
+    try std.testing.expectEqual(@as(u64, 5), c.copies);
+    try std.testing.expectEqual(@as(u64, 0), c.preads);
+    // Pages taken back, as far as the map knows: the pread that finds one gone starts another pass, after which
+    // every page is held again.
+    forget(f.fd);
+    try std.testing.expect(readRow(f.fd, &row, 3 * page + 5));
+    try std.testing.expectEqual(@as(u64, 1), counts(f.fd).preads);
+    while (warmed(f.fd).?.passes < 2) _ = usleep(1000);
+    settle(f.fd);
+    try std.testing.expect(holds(f.fd, 30 * page, 256));
+    try std.testing.expectEqual(@as(u32, 0), warmed(f.fd).?.strikes);
+}
+
+test "engram_direct map: a pass reads the chunks whose pages are not held and no others, and a file unmapped mid-pass ends it" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const page = std.heap.pageSize();
+    const data = try a.alloc(u8, 9 * page);
+    defer a.free(data);
+    @memset(data, 7);
+    const f = try testFile(a, "pass", data);
+    defer a.free(f.path);
+    defer _ = std.c.unlink(f.path);
+    defer _ = std.c.close(f.fd);
+    map(f.fd);
+    {
+        defer unmap(f.fd);
+        settle(f.fd);
+        const m = mapOf(f.fd).?;
+        // One page not held: the reader of its part reads that page's chunk alone.
+        @atomicStore(u8, &m.held[4], 0, .monotonic);
+        var w: Warm = .{};
+        for (0..Warm.readers) |k| Warm.part(m.*, &w, k);
+        try std.testing.expectEqual(@as(u64, Warm.chunk), w.read.load(.monotonic));
+        try std.testing.expect(holds(f.fd, 4 * page, 16));
+        // Told to stop, a reader reads nothing.
+        forget(f.fd);
+        w.stop.store(true, .release);
+        for (0..Warm.readers) |k| Warm.part(m.*, &w, k);
+        try std.testing.expectEqual(@as(u64, Warm.chunk), w.read.load(.monotonic));
+        try std.testing.expect(!holds(f.fd, 0, 16));
+    }
+    // A map closed while its pass may still be running: the close waits for it.
+    map(f.fd);
+    warm(f.fd);
+    unmap(f.fd);
+    try std.testing.expect(!mapped(f.fd));
 }
 
 test "engram_direct map: a stretch of copies ends every stride and counts its own page-ins" {

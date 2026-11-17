@@ -111,6 +111,12 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   95% of a prompt's row reads) stay copies, since preads of one file top out near 586,000 a second whatever the
   threads. Staleness is the task's page-in count over a stretch of copies, never a copy's time: a first touch of a
   cached page is slow too.
+- A resident pack's mapped Engram tables are read into the page cache once the weights are loaded (`engram_direct.warm`,
+  when what is free or reclaimable holds them; `MLX_SERVE_DSV41_ENGRAM_WARM=0`): the load pushes them out, and a row
+  is a pread until its page is back.
+- Pages the system takes back are read again while rows are still read by pread (`Warm.again`, four times rarer each
+  time a quarter of a file is gone again): any large write pushes table pages out (a trace's files took 40% of
+  both), and a decode row on a page that is gone waits on the drive with the GPU idle.
 - A resident pack reads its Engram CODES past the page cache while memory is tight (`Table.openCodes`, `pastCache`,
   `engram.cacheTight`: under an eighth of RAM free, asked at each prompt chunk), its scales always through it: with
   no room the cache evicted the scales to hold codes read once and every row cost two reads; with room the cache wins.
