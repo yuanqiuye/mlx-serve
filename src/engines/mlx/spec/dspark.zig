@@ -23,6 +23,7 @@ const SamplingParams = @import("../sampling/params.zig").SamplingParams;
 const capAcceptedForTokenBudget = @import("verify.zig").capAcceptedForTokenBudget;
 const dsparkCopyLen = @import("verify.zig").dsparkCopyLen;
 const mtpBatchedAcceptGraph = @import("mtp/batched_graph.zig").mtpBatchedAcceptGraph;
+const MtpBatchedGraph = @import("mtp/batched_graph.zig").MtpBatchedGraph;
 const mtpBatchedTypicalGraph = @import("mtp/batched_graph.zig").mtpBatchedTypicalGraph;
 const mtpBatchedTokenV3Graph = @import("mtp/batched_graph.zig").mtpBatchedTokenV3Graph;
 const mtp_acceptance = @import("../../../sdk/spec/mtp_acceptance.zig");
@@ -561,9 +562,40 @@ fn lazyStays(rule: mtp_acceptance.Mode, prng_in: std.Random.DefaultPrng, accept_
 /// prefix is the residual sample at the first reject, or the bonus draw from the last row on a full accept. With
 /// MLX_SERVE_KEYED_SAMPLING a keyed request takes the serial verdict instead.
 pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32, behind: ?Behind) !Verdict {
-    if (env.on(.MLX_SERVE_KEYED_SAMPLING) and keyedSerial(self.sampling)) return serialVerdict(self, vl_g, verify, vocab, accepted_cap);
-    const s = self.xfm.s;
+    var pending = try stochasticBegin(self, vl_g, verify, vocab, accepted_cap, behind != null);
+    defer pending.deinit();
+    if (behind) |bh| if (pending.lazy) |l| try bh.launch(bh.ctx, l[0], l[1]);
+    return stochasticFinish(self, &pending);
+}
+
+/// A sampled verdict between its two steps: `stochasticBegin` hands its graph to the GPU in one batch, and
+/// `stochasticFinish` reads it. Between them a caller queues what follows the verdict (`lazy`: the drafts kept, an
+/// int32 scalar, and the token after them, `[1]` int32, as the GPU picks them; null for a rule that is not one test a
+/// position, and for a keyed request's serial verdict, which is read at once).
+pub const Sampled = struct {
+    b: u32,
+    cap: u32,
+    lazy: ?[2]mlx.mlx_array = null,
+    /// A verify of `t1` alone: the draw.
+    draw: mlx.mlx_array = .{ .ctx = null },
+    graph: ?MtpBatchedGraph = null,
+    serial: ?Verdict = null,
+
+    pub fn deinit(self: *Sampled) void {
+        if (self.lazy) |l| for (l) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        if (self.draw.ctx != null) _ = mlx.mlx_array_free(self.draw);
+        if (self.graph) |*g| g.deinit();
+    }
+};
+
+/// `stochasticVerdict`'s graph, with the GPU as one batch and not read: the request's draw counter and nothing else
+/// has moved. `want_lazy` also picks the verdict on the GPU (`Sampled.lazy`).
+pub fn stochasticBegin(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32, want_lazy: bool) !Sampled {
     const b: u32 = @intCast(verify.len - 1);
+    if (env.on(.MLX_SERVE_KEYED_SAMPLING) and keyedSerial(self.sampling)) return .{ .b = b, .cap = accepted_cap, .serial = try serialVerdict(self, vl_g, verify, vocab, accepted_cap) };
+    const s = self.xfm.s;
 
     // Filtered target probs over every verify row: [b+1, V] → [1, b+1, V].
     const vshape = [_]c_int{ 1, @intCast(verify.len), @intCast(vocab) };
@@ -574,8 +606,10 @@ pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const 
     const probs_all = try probsAllPositions(vl3, sp, s);
     defer _ = mlx.mlx_array_free(probs_all);
 
-    var accepted: u32 = 0;
-    var next_token: u32 = undefined;
+    var out: Sampled = .{ .b = b, .cap = accepted_cap };
+    errdefer out.deinit();
+    const ev = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ev);
     if (b == 0) {
         // The confidence gate submitted nothing: this round verifies t1
         // alone and row 0 IS the bonus row — sample the next trunk token
@@ -588,21 +622,16 @@ pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const 
         var sampled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sampled);
         try mlx.check(mlx.mlx_random_categorical(&sampled, log_p, -1, key, s));
-        var samp_i = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(samp_i);
-        try mlx.check(mlx.mlx_astype(&samp_i, sampled, .int32, s));
-        if (behind) |bh| {
-            const none_kept = mlx.mlx_array_new_int(0);
-            defer _ = mlx.mlx_array_free(none_kept);
+        out.draw = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&out.draw, sampled, .int32, s));
+        _ = mlx.mlx_vector_array_append_value(ev, out.draw);
+        if (want_lazy) {
             var next = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(next);
-            try mlx.check(mlx.mlx_reshape(&next, samp_i, &[_]c_int{1}, 1, s));
-            try bh.launch(bh.ctx, none_kept, next);
+            errdefer _ = mlx.mlx_array_free(next);
+            try mlx.check(mlx.mlx_reshape(&next, out.draw, &[_]c_int{1}, 1, s));
+            out.lazy = .{ mlx.mlx_array_new_int(0), next };
+            _ = mlx.mlx_vector_array_append_value(ev, next);
         }
-        try mlx.check(mlx.mlx_array_eval(samp_i));
-        var v: i32 = 0;
-        try mlx.check(mlx.mlx_array_item_int32(&v, samp_i));
-        next_token = @intCast(v);
     } else {
         // [1] int32 arrays of the draft ids (already realized host values
         // — dsv4 drafts synchronously, unlike the MTP head's lazy chain).
@@ -617,35 +646,42 @@ pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const 
             draft_arrs[k] = mlx.mlx_array_new_data(&idv, &idshape, 1, .int32);
             n_arrs += 1;
         }
-        var bg = switch (self.dspark_accept) {
+        out.graph = switch (self.dspark_accept) {
             .exact => try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..b], null, b, sp, s),
             .typical => |cfg| try mtpBatchedTypicalGraph(probs_all, draft_arrs[0..b], null, b, cfg.delta, sp, s),
             .tokenv3 => |alpha| try mtpBatchedTokenV3Graph(probs_all, draft_arrs[0..b], null, b, alpha, sp, s),
         };
-        defer bg.deinit();
-
+        const bg = &out.graph.?;
         // The same verdict picked on the GPU, for what goes behind it (`Behind`).
-        var lazy: ?[2]mlx.mlx_array = null;
-        defer if (lazy) |l| for (l) |a| {
-            _ = mlx.mlx_array_free(a);
-        };
-        if (behind != null and b <= 16) if (try lazyStays(self.dspark_accept, self.prng, bg.accept_p, bg.accept_q, b, s)) |stays| {
+        if (want_lazy and b <= 16) if (try lazyStays(self.dspark_accept, self.prng, bg.accept_p, bg.accept_q, b, s)) |stays| {
             defer _ = mlx.mlx_array_free(stays);
-            lazy = try lazyVerdict(stays, bg.corr_samples, b, accepted_cap, s);
+            out.lazy = try lazyVerdict(stays, bg.corr_samples, b, accepted_cap, s);
         };
-        // ONE bounded sync: the accept vector + pre-sampled corrections
-        // (and the whole verify graph beneath them) in one batched eval.
-        {
-            const ev = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(ev);
-            var buf: [4]mlx.mlx_array = undefined;
-            for (bg.readouts(&buf)) |a| _ = mlx.mlx_vector_array_append_value(ev, a);
-            if (lazy) |l| for (l) |a| {
-                _ = mlx.mlx_vector_array_append_value(ev, a);
-            };
-            try mlx.check(mlx.mlx_async_eval(ev));
-        }
-        if (lazy) |l| try behind.?.launch(behind.?.ctx, l[0], l[1]);
+        var buf: [4]mlx.mlx_array = undefined;
+        for (bg.readouts(&buf)) |a| _ = mlx.mlx_vector_array_append_value(ev, a);
+        if (out.lazy) |l| for (l) |a| {
+            _ = mlx.mlx_vector_array_append_value(ev, a);
+        };
+    }
+    // ONE bounded sync: the accept vector + pre-sampled corrections
+    // (and the whole verify graph beneath them) in one batched eval.
+    try mlx.check(mlx.mlx_async_eval(ev));
+    return out;
+}
+
+/// The verdict of `stochasticBegin`, read: the request's generator draws as the host's rule draws.
+pub fn stochasticFinish(self: *Generator, p: *Sampled) !Verdict {
+    if (p.serial) |v| return v;
+    const b = p.b;
+    var accepted: u32 = 0;
+    var next_token: u32 = undefined;
+    if (b == 0) {
+        try mlx.check(mlx.mlx_array_eval(p.draw));
+        var v: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&v, p.draw));
+        next_token = @intCast(v);
+    } else {
+        const bg = &p.graph.?;
         try mlx.check(mlx.mlx_array_eval(bg.accept_p));
         const p_data = mlx.mlx_array_data_float32(bg.accept_p) orelse return error.MlxArrayDataNull;
         switch (self.dspark_accept) {
@@ -670,7 +706,7 @@ pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const 
         }
         // Pick the correction at the request-budget boundary and let
         // dsparkFinish roll module-owned state back to that same point.
-        accepted = @min(accepted, accepted_cap);
+        accepted = @min(accepted, p.cap);
         try mlx.check(mlx.mlx_array_eval(bg.corr_samples));
         const corr = mlx.mlx_array_data_int32(bg.corr_samples) orelse return error.MlxArrayDataNull;
         next_token = @intCast(corr[accepted]);

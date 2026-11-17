@@ -145,19 +145,31 @@ pub var sample_rows_evals: u64 = 0;
 /// a failed eval never replays a key.
 pub fn sampleRows(out: []i32, row_logits: []const mlx.mlx_array, params: []SamplingParams, s: mlx.mlx_stream) !void {
     std.debug.assert(out.len == row_logits.len and out.len == params.len);
-    const n = row_logits.len;
-    if (n == 0) return;
-    const lazy = try sampleRowsLazy(row_logits, params, s);
+    if (row_logits.len == 0) return;
+    const lazy = try sampleRowsBegin(row_logits, params, s);
     defer _ = mlx.mlx_array_free(lazy);
+    try sampleRowsRead(out, lazy);
+}
+
+/// `sampleRows`' draws as the GPU's array, not evaluated (`[n]`; one row: a scalar), each row's draw counter moved as
+/// `sampleRows` moves it: what a caller queues work behind before `sampleRowsRead` reads it. Caller frees.
+pub fn sampleRowsBegin(row_logits: []const mlx.mlx_array, params: []SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    std.debug.assert(row_logits.len == params.len and row_logits.len > 0);
+    const lazy = try sampleRowsLazy(row_logits, params, s);
     for (params) |*p| p.draw +%= 1;
+    return lazy;
+}
+
+/// The draws of `sampleRowsBegin` on the host, one a row.
+pub fn sampleRowsRead(out: []i32, lazy: mlx.mlx_array) !void {
     sample_rows_evals += 1;
     try mlx.check(mlx.mlx_array_eval(lazy));
-    if (n == 1) {
+    if (out.len == 1) {
         try mlx.check(mlx.mlx_array_item_int32(&out[0], lazy));
         return;
     }
     const data = mlx.mlx_array_data_uint32(lazy) orelse return error.MlxError;
-    for (out, data[0..n]) |*dst, v| dst.* = @intCast(v);
+    for (out, data[0..out.len]) |*dst, v| dst.* = @intCast(v);
 }
 
 /// Rows may share one stacked graph only when every filter matches; a seed
