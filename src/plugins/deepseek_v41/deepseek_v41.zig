@@ -449,7 +449,9 @@ pub const Dsv41Model = struct {
     /// replayed.
     ced_split: ?usize = null,
     ced_min_skip: usize = CED_MIN_SKIP,
-    ced_stats: struct { chunks: u64 = 0, skipped: u64 = 0 } = .{},
+    /// Chunks that ran the decoder over their last window alone, the rows that skipped it, the chunks that put that
+    /// replay off (`Want.encode_keep`) and the replays made later (`completeReplay`).
+    ced_stats: struct { chunks: u64 = 0, skipped: u64 = 0, put_off: u64 = 0, made_later: u64 = 0 } = .{},
     /// Threads per threadgroup of the hc kernels, all four alike so the wide and decode-width stages sum in one order.
     hc_tg: usize = HC_TG,
     /// Threads per top-k threadgroup (`probeTopkThreads`); the picks are the same at any width.
@@ -2366,8 +2368,31 @@ pub const State = struct {
     snap_at: ?usize = null,
     snap_ids: []u32 = &.{},
     snap_vision_key: u64 = 0,
+    /// The last chunk's last window as its encoder left it, where that chunk put off the decoder's replay
+    /// (`Want.encode_keep`): until `completeReplay` runs the decoder over it, the decoder layers' windows, the DSpark
+    /// windows and `mh` are not this position's.
+    replay: ?Tail = null,
+
+    /// A chunk's last `n` rows from position `p0` after the encoder layers: the stream `[n, hc, dim]` and its mix.
+    pub const Tail = struct {
+        x: A,
+        pre: A,
+        p0: usize,
+        n: usize,
+
+        fn deinit(self: *Tail) void {
+            _ = mlx.mlx_array_free(self.x);
+            _ = mlx.mlx_array_free(self.pre);
+        }
+    };
+
+    fn dropReplay(self: *State) void {
+        if (self.replay) |*r| r.deinit();
+        self.replay = null;
+    }
 
     pub fn deinit(self: *State) void {
+        self.dropReplay();
         if (self.snap) |*sn| sn.deinit(self.gpa);
         self.gpa.free(self.snap_ids);
         for (self.layers) |*l| l.deinit();
@@ -4719,7 +4744,20 @@ pub const ENGRAM_INS = [_][*:0]const u8{ "x", "kv", "qk", "cst" };
 /// compressor runs, so the global rows and index keys stay as they are (`rewind`).
 /// `encode`: no logits. A prompt chunk the same call continues with one that replays (`extendCold`): the encoder's
 /// layers and the decoder's global rows, without the decoder's replay, whose windows the next chunk never reads.
-pub const Want = enum { last, all, replay, encode };
+/// What a chunk is forwarded for: its last row's logits, every row's, the bounded replay of a window (`rewind`), the
+/// encoder alone (`encode`: the decoder's replay is the next chunk's), or the encoder alone with the chunk's last
+/// window kept (`encode_keep`: the replay is put off until something needs the state whole, `completeReplay`).
+pub const Want = enum {
+    last,
+    all,
+    replay,
+    encode,
+    encode_keep,
+
+    fn encodes(w: Want) bool {
+        return w == .encode or w == .encode_keep;
+    }
+};
 
 /// One block over one span: the staggered hyper-connections around
 /// attention and the MoE. Returns the new stream; `pre` becomes the FFN's
@@ -5068,6 +5106,11 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     const p0 = st.n;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
+    // A replay the chunk before put off: a chunk that replays its own window, runs the encoder alone or rebuilds a
+    // window (`rewind`) reads no decoder window from before it; any other step needs the state whole first.
+    if (st.replay != null) {
+        if (want.encodes() or want == .replay or (ids == .host and cedTail(m, st, L, want) != null)) st.dropReplay() else try completeReplay(m, gpa, st);
+    }
     // A draft launched ahead and not read by now is no round's; a verify's lead serves the rows it began with.
     m.dropNextDraft();
     m.dropGroupLead();
@@ -5239,14 +5282,34 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
         try exchange(m, gpa, &sp, p0, st.snap_at != null and st.snap_at.? == p0 + L, if (st.verify) |v| v.n0 == p0 else false);
         from = p.hi;
     }
-    if (want == .encode and (m.ced_split == null or m.pair != null or st.verify != null)) return error.Dsv41EncodeUnsupported;
-    const enc_hi = if (tail != null or want == .encode) m.ced_split.? else m.n_layers;
+    if (want.encodes() and (m.ced_split == null or m.pair != null or st.verify != null)) return error.Dsv41EncodeUnsupported;
+    if (want == .encode_keep and (L < c.sliding_window or images or ids != .host)) return error.Dsv41EncodeUnsupported;
+    const enc_hi = if (tail != null or want.encodes()) m.ced_split.? else m.n_layers;
     try runLayers(m, gpa, st, &sp, held, from, enc_hi);
-    if (want == .encode) {
+    if (want.encodes()) {
         try cedCompress(m, gpa, st, &sp, enc_hi);
-        st.n = p0 + L;
         var ev: std.ArrayList(A) = .empty;
         defer ev.deinit(gpa);
+        if (want == .encode_keep) {
+            // The rows the decoder's replay takes (`cedReplayIn`), kept: the last window's stream and mix.
+            var ksc = Scope.init(gpa, m.s);
+            defer ksc.deinit();
+            const tl: usize = c.sliding_window;
+            const skip = sp.L - tl;
+            const k0 = skip / sp.span;
+            const off = skip - k0 * sp.span;
+            const x = try ksc.slice(try ksc.concat(sp.xs[k0..], 0), 0, off, off + tl);
+            const pre = try ksc.slice(try ksc.concat(sp.pres[k0..], 0), 0, off, off + tl);
+            st.dropReplay();
+            st.replay = .{ .x = ksc.out(x), .pre = ksc.out(pre), .p0 = p0 + L - tl, .n = tl };
+            try ev.append(gpa, st.replay.?.x);
+            try ev.append(gpa, st.replay.?.pre);
+            m.ced_stats.chunks += 1;
+            m.ced_stats.skipped += L - tl;
+            m.ced_stats.put_off += 1;
+            log.info("[dsv41] CED prefill: {d} rows encoder-only, the replay of {d} rows put off\n", .{ L - tl, tl });
+        }
+        st.n = p0 + L;
         for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
         try asyncEvalAll(ev.items);
         return none;
@@ -5932,6 +5995,58 @@ fn cedCompress(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Sp
 /// CED: `cedCompress`, then `sp`'s last rows become `tsp`'s spans, the decoder's input; `sp`'s streams are released.
 /// The rows before the tail get no decoder window KV, which no tail query reaches: the tail's band stops at its first
 /// row.
+/// The decoder's replay a chunk put off (`Want.encode_keep`), made now: the decoder layers over the window that chunk
+/// kept, its band stopped at its first row, then the window's DSpark main rows, as the chunk's own replay would have
+/// left them (the same rows through the same launches; the compressor ran with the chunk). A no-op with none put off.
+pub fn completeReplay(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State) !void {
+    var r = st.replay orelse return;
+    st.replay = null;
+    defer r.deinit();
+    const enc_hi = m.ced_split orelse return error.Dsv41ReplayPending;
+    if (st.n != r.p0 + r.n or st.verify != null or m.pair != null) return error.Dsv41ReplayPending;
+    const c = &m.cfg;
+    const span = m.span;
+    const targets: usize = if (m.n_mtp > 0) c.dsv4_n_dspark_target_layers else 0;
+    const n_tail = (r.n + span - 1) / span;
+    const held = try gpa.alloc(A, n_tail * (4 + targets) + 2);
+    defer {
+        for (held) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+        gpa.free(held);
+    }
+    @memset(held, none);
+    var tsp = spansOf(held, n_tail, targets, span, r.n, r.p0);
+    tsp.whole = held[held.len - 2 ..][0..2];
+    tsp.floor = tsp.p0;
+    {
+        var sc = Scope.init(gpa, m.s);
+        defer sc.deinit();
+        for (0..n_tail) |k| {
+            const lo, const hi = tsp.bounds(k);
+            hold(&tsp.xs[k], try sc.slice(r.x, 0, lo, hi));
+            hold(&tsp.pres[k], try sc.slice(r.pre, 0, lo, hi));
+        }
+    }
+    try runLayers(m, gpa, st, &tsp, held, enc_hi, m.n_layers);
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    if (m.n_mtp > 0) {
+        var rows: std.ArrayList(A) = .empty;
+        defer rows.deinit(gpa);
+        for (0..tsp.xs.len) |k| try rows.append(gpa, try sc.concat(tsp.mh[k * targets ..][0..targets], -1));
+        try commitMain(&sc, m, st, try sc.concat(rows.items, 0), tsp.p0);
+    }
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(gpa);
+    for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
+    for (st.ds) |ring| try ev.append(gpa, ring.buf);
+    if (st.mh.ctx != null) try ev.append(gpa, st.mh);
+    try asyncEvalAll(ev.items);
+    m.ced_stats.made_later += 1;
+    log.info("[dsv41] CED prefill: the replay of {d} rows put off at {d} made now\n", .{ r.n, r.p0 + r.n });
+}
+
 fn cedReplayIn(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, tsp: *const Spans, li: usize) !void {
     try cedCompress(m, gpa, st, sp, li);
     var sc = Scope.init(gpa, m.s);
@@ -6627,6 +6742,7 @@ fn restoreAt(m: *Dsv41Model, n: usize) !bool {
 
 fn applySnap(st: *State, sn: *const Snap) !void {
     st.dropVerify();
+    st.dropReplay();
     for (st.layers, sn.layers) |*l, s| {
         hold(&l.win.buf, s.win);
         if (l.comp) |*r| r.deinit();
@@ -6667,12 +6783,15 @@ pub fn stateFromSnapshot(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *cons
 /// Takes the armed snapshot once the state stands at its position.
 fn snapshotIfDue(m: *Dsv41Model) !void {
     const st = if (m.dec_state) |*st| st else return;
+    if (st.snap_at) |at| if (st.n == at) try completeReplay(m, st.gpa, st);
     return snapshotStateIfDue(st, m.state_gen);
 }
 
 pub fn snapshotStateIfDue(st: *State, gen: u64) !void {
     const at = st.snap_at orelse return;
     if (st.n != at) return;
+    // A capture is the state whole: its callers make a replay put off first (`completeReplay`).
+    if (st.replay != null) return error.Dsv41ReplayPending;
     const layers = try st.gpa.alloc(Snap.LSnap, st.layers.len);
     errdefer st.gpa.free(layers);
     const ds = try st.gpa.alloc(A, st.ds.len);
@@ -6704,10 +6823,12 @@ pub fn snapshotStateIfDue(st: *State, gen: u64) !void {
 /// The capture an unfinished prompt leaves: the state where its last forwarded chunk ended, keyed by the armed ids up
 /// to there, so an abandoned prefill resumes instead of starting over. Nothing when no capture is armed, nothing
 /// was forwarded, or an image of the prompt lies past that point (the armed key hashes every image row).
-pub fn snapshotStateAtChunk(m: *const Dsv41Model, st: *State, gen: u64) !void {
+pub fn snapshotStateAtChunk(m: *Dsv41Model, st: *State, gen: u64) !void {
     const at = st.snap_at orelse return;
     if (st.snap != null or st.n == 0 or st.n >= at) return;
     if (m.imageRows(st.snap_ids[0..st.n]) != m.imageRows(st.snap_ids)) return;
+    // The chunk that ended here may have put off its decoder replay: a capture is the state whole.
+    try completeReplay(m, st.gpa, st);
     const ids = try st.gpa.dupe(u32, st.snap_ids[0..st.n]);
     st.gpa.free(st.snap_ids);
     st.snap_ids = ids;
@@ -6801,6 +6922,7 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     for (states, 0..) |st, k| for (states[0..k]) |o| if (o == st) return error.Dsv41BatchUnsupported;
     for (states, gens) |st, g| {
         if (st.verify != null) return error.Dsv41BatchUnsupported;
+        try completeReplay(m, gpa, st);
         try snapshotStateIfDue(st, g);
     }
     if (verify) for (states, 0..) |st, k| armVerify(st, m.n_layers) catch |e| {
@@ -7331,6 +7453,7 @@ pub fn draftAheadFits(m: *const Dsv41Model, st: *const State, a: *const DraftAhe
 /// The same ops as `dsparkDraft`'s (`draftGraph`).
 pub fn dsparkDraftLaunch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) !DraftAhead {
     if (!draftAheadOk(m)) return error.DraftAheadUnsupported;
+    try completeReplay(m, gpa, st);
     const t0 = monoUs();
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
@@ -7356,6 +7479,7 @@ pub fn dsparkDraftCollect(m: *Dsv41Model, gpa: std.mem.Allocator, a: *DraftAhead
 }
 /// `keep_logits` also copies the Markov-biased rows to the host.
 fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_logits: bool) !DsparkDraft {
+    try completeReplay(m, gpa, st);
     m.dropDraftScope();
     m.dropLead();
     m.dropGroupLead();
@@ -7909,6 +8033,7 @@ pub const DraftLead = struct {
 /// the Markov chain steps every state's row at once. `keep_logits` also copies the Markov-biased rows to the host.
 pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, t1s: []const u32, keep_logits: bool, out: []DsparkDraft, verify: ?DraftLead) !void {
     if (states.len > region_rows) return error.Dsv41BatchUnsupported;
+    for (states) |st| try completeReplay(m, gpa, st);
     m.dropNextDraft();
     m.dropLead();
     // The step before this round may already have begun the verify's first rows (`leadBatched`): they stand.
